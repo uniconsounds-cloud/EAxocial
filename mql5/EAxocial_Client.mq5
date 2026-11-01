@@ -15,10 +15,10 @@
 
 //--- EA Inputs
 input group "=== EAxocial Cloud Connection ==="
-input string   InpTerminalToken    = "DEMO_TOKEN_12345";       // Terminal Secret Token
-input string   InpServerBaseUrl    = "http://localhost:3000";   // Web Platform URL
-input int      InpSyncIntervalSec  = 3;                         // Sync Heartbeat Interval (Seconds)
-input ulong    InpMagicNumber      = 889900;                    // EA Magic Number
+input string   InpTerminalToken    = "DEMO_TOKEN_12345";            // Terminal Secret Token
+input string   InpServerBaseUrl    = "https://eaxocial.vercel.app";  // Web Platform URL
+input int      InpSyncIntervalSec  = 3;                              // Sync Heartbeat Interval (Seconds)
+input ulong    InpMagicNumber      = 889900;                         // EA Magic Number
 
 input group "=== Local Safety Fallback ==="
 input double   InpMaxSpreadPoints  = 40.0;                      // Max Allowable Spread (Points)
@@ -278,6 +278,8 @@ void SyncWithServer()
    else
    {
       g_isServerConnected = false;
+      int err = GetLastError();
+      Print("⚠️ EAxocial Sync WebRequest Failed! HTTP: ", res, " | Err: ", err, " | URL: ", url);
    }
 }
 
@@ -317,18 +319,18 @@ void SendHeartbeat()
 //+------------------------------------------------------------------+
 void UpdateChartHUD()
 {
-   string syncIcon = g_isServerConnected ? "🟢 SYNC: ONLINE" : "🔴 SYNC: OFFLINE";
-   string verIcon  = g_isVersionMatch ? "🟢 VERSION: v" + CLIENT_VERSION + " (OK)" : "🟡 VERSION: UPDATE AVAILABLE";
+   string syncIcon = g_isServerConnected ? "[ONLINE] Connected" : "[OFFLINE] Disconnected";
+   string verIcon  = g_isVersionMatch ? "[MATCH] v" + CLIENT_VERSION + " (OK)" : "[UPDATE] Update Available";
    
-   string stateIcon = "⚪ IDLE (Waiting for Setup)";
-   if(g_tradingState == "in_position") stateIcon = "🔵 IN POSITION (Holding)";
-   else if(g_tradingState == "recovering") stateIcon = "🟡 RECOVERING (Grid Zone Active)";
-   else if(g_tradingState == "tp_hit") stateIcon = "🟢 TARGET HIT! (Profit Secured)";
-   else if(g_tradingState == "shield_cut") stateIcon = "🛡️ SHIELD ACTIVE (Spread / Safety)";
+   string stateIcon = "[IDLE] Waiting for Setup";
+   if(g_tradingState == "in_position") stateIcon = "[IN POSITION] Holding Trade";
+   else if(g_tradingState == "recovering") stateIcon = "[RECOVERING] Grid Zone Active";
+   else if(g_tradingState == "tp_hit") stateIcon = "[TP HIT] Profit Secured!";
+   else if(g_tradingState == "shield_cut") stateIcon = "[SHIELD] Risk Filter Active";
 
    string hud = "\n" +
       "===============================================\n" +
-      "   🚀 EAxocial Universal Terminal Bridge       \n" +
+      "   >>> EAxocial Universal Terminal Bridge <<<  \n" +
       "===============================================\n" +
       " [STATUS]   " + syncIcon + "\n" +
       " [ENGINE]   " + verIcon + "\n" +
