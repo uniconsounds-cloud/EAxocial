@@ -2,10 +2,94 @@ import { StrategyModel } from '@/types/strategy';
 
 export const STARTER_PRESETS: StrategyModel[] = [
   {
+    id: 'strat-stoch-ema400',
+    title: 'Apex 400 Stoch Sniper (RR 1.5)',
+    slug: 'apex-400-stoch-sniper',
+    description: 'กลยุทธ์ตามภาพต้นแบบ: กรองเทรนด์ใหญ่ด้วยราคาเหนือ EMA 400 จากนั้นรอ Stochastic (15, 2, 9) ลงแตะโซน Oversold < 20 แล้วตัดขึ้น (%K Cross %D) ตั้ง SL ที่ Swing Low ก่อนหน้า และ Take Profit ที่อัตราส่วน RR 1.5 เท่า',
+    source_platform: 'youtube',
+    badge_type: 'storm_strike',
+    aggression_level: 2,
+    defense_level: 4,
+    tags: ['EMA 400', 'Stochastic (15,2,9)', 'Swing-Low-SL', 'RR 1.5', 'XAUUSD', 'Sniper'],
+    is_public: true,
+    is_verified: true,
+    version: '1.0.0',
+    likes_count: 894,
+    forks_count: 412,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    recipe: {
+      version: '1.0.0',
+      symbol: 'XAUUSD',
+      timeframe: 'M15',
+      entry: {
+        setupConditions: [
+          {
+            id: 'c1',
+            indicator: 'EMA',
+            timeframe: 'M15',
+            period: 400,
+            operator: 'ABOVE',
+            direction: 'BUY',
+          },
+          {
+            id: 'c2',
+            indicator: 'STOCHASTIC',
+            timeframe: 'M15',
+            period: 15,
+            stochKPeriod: 15,
+            stochKSmoothing: 2,
+            stochDSmoothing: 9,
+            operator: 'STOCH_K_BELOW_LEVEL',
+            thresholdValue: 20,
+            direction: 'BUY',
+          },
+          {
+            id: 'c3',
+            indicator: 'STOCHASTIC',
+            timeframe: 'M15',
+            period: 15,
+            stochKPeriod: 15,
+            stochKSmoothing: 2,
+            stochDSmoothing: 9,
+            operator: 'STOCH_K_CROSS_UP_D',
+            direction: 'BUY',
+          },
+        ],
+        triggerMode: 'NEXT_BAR_OPEN',
+        initialLotSize: 0.02,
+      },
+      recovery: {
+        mode: 'SINGLE_ORDER',
+        maxOrders: 1,
+        gridDistancePoints: 0,
+        lotMultiplier: 1.0,
+      },
+      exit: {
+        mode: 'SWING_LOW_HIGH_RR',
+        riskRewardRatio: 1.5,
+        swingLookbackBars: 10,
+        stopLossPoints: 350,
+      },
+      shield: {
+        maxSpreadPoints: 30,
+        maxDailyLossPercent: 3.0,
+        maxAccountDrawdownPercent: 10.0,
+        newsFilterEnabled: true,
+        newsBufferMinutes: 30,
+        tradingSessions: {
+          asian: false,
+          london: true,
+          newYork: true,
+        },
+      },
+    },
+  },
+  {
     id: 'strat-golden-trend',
     title: 'Golden Trend Pullback Core',
     slug: 'golden-trend-pullback',
-    description: 'กลยุทธ์ตามเทรนด์ยอดนิยมระดับโลก ใช้ EMA 50/200 กรองทิศทางใหญ่ แล้วรอจังหวะย่อตัวด้วย RSI 14 เข้าแม่นยำ พร้อมตั้ง RR 1:2',
+    description: 'กลยุทธ์ตามเทรนด์ระดับโลก ใช้ EMA 50/200 กรองทิศทางใหญ่ แล้วรอจังหวะย่อตัวด้วย RSI 14 เข้าแม่นยำ พร้อมตั้ง RR 1:2',
     source_platform: 'manual',
     badge_type: 'storm_strike',
     aggression_level: 2,
@@ -25,6 +109,7 @@ export const STARTER_PRESETS: StrategyModel[] = [
       entry: {
         setupConditions: [
           {
+            id: 'gt1',
             indicator: 'EMA',
             timeframe: 'M15',
             period: 50,
@@ -33,6 +118,7 @@ export const STARTER_PRESETS: StrategyModel[] = [
             direction: 'BUY',
           },
           {
+            id: 'gt2',
             indicator: 'RSI',
             timeframe: 'M15',
             period: 14,
@@ -53,7 +139,7 @@ export const STARTER_PRESETS: StrategyModel[] = [
       exit: {
         mode: 'RISK_REWARD',
         stopLossPoints: 400,
-        riskRewardRatio: 2.0, // TP = 800 points
+        riskRewardRatio: 2.0,
       },
       shield: {
         maxSpreadPoints: 30,
@@ -94,6 +180,7 @@ export const STARTER_PRESETS: StrategyModel[] = [
       entry: {
         setupConditions: [
           {
+            id: 'qg1',
             indicator: 'RSI',
             timeframe: 'M15',
             period: 14,
@@ -154,6 +241,7 @@ export const STARTER_PRESETS: StrategyModel[] = [
       entry: {
         setupConditions: [
           {
+            id: 'bb1',
             indicator: 'BOLLINGER',
             timeframe: 'M5',
             period: 20,

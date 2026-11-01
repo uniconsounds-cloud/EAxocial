@@ -34,27 +34,28 @@ string         g_currentServerVer  = "1.0.0";
 bool           g_isVersionMatch    = true;
 bool           g_isServerConnected = false;
 string         g_tradingState      = "idle"; // idle, in_position, recovering, tp_hit, shield_cut
-string         g_strategyTitle     = "Golden Trend Pullback (Synced)";
+string         g_strategyTitle     = "Apex 400 Stoch Sniper (RR 1.5)";
 datetime       g_lastSyncTime      = 0;
 
 // Strategy Parameters (Received from Web Recipe)
-string         g_entryIndicator    = "EMA";
-int            g_entryPeriod1      = 50;
-int            g_entryPeriod2      = 200;
-string         g_entryDirection    = "BUY";
-double         g_initialLot        = 0.01;
+int            g_emaPeriod         = 400;
+int            g_stochK            = 15;
+int            g_stochSlowing      = 2;
+int            g_stochD            = 9;
+double         g_stochOversold     = 20.0;
+double         g_riskRewardRatio   = 1.5;
+int            g_swingLookback     = 10;
+double         g_initialLot        = 0.02;
 string         g_recoveryMode      = "SINGLE_ORDER"; // SINGLE_ORDER, FIXED_GRID
-int            g_maxOrders         = 3;
+int            g_maxOrders         = 1;
 int            g_gridDistancePts   = 300;
-double         g_lotMultiplier     = 1.5;
-string         g_exitMode          = "RISK_REWARD";  // RISK_REWARD, BASKET_DOLLAR
+double         g_lotMultiplier     = 1.0;
+string         g_exitMode          = "SWING_LOW_HIGH_RR";  // SWING_LOW_HIGH_RR, BASKET_DOLLAR
 double         g_basketDollar      = 15.0;
-int            g_takeProfitPts     = 600;
-int            g_stopLossPts       = 300;
 
 // Indicator Handles
-int            g_hEMA1             = INVALID_HANDLE;
-int            g_hEMA2             = INVALID_HANDLE;
+int            g_hEMA400           = INVALID_HANDLE;
+int            g_hStoch            = INVALID_HANDLE;
 int            g_hRSI              = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
@@ -67,9 +68,9 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
 
    // Initialize Indicator Handles
-   g_hEMA1 = iMA(_Symbol, _Period, g_entryPeriod1, 0, MODE_EMA, PRICE_CLOSE);
-   g_hEMA2 = iMA(_Symbol, _Period, g_entryPeriod2, 0, MODE_EMA, PRICE_CLOSE);
-   g_hRSI  = iRSI(_Symbol, _Period, 14, PRICE_CLOSE);
+   g_hEMA400 = iMA(_Symbol, _Period, g_emaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_hStoch  = iStochastic(_Symbol, _Period, g_stochK, g_stochD, g_stochSlowing, MODE_SMA, STO_LOWHIGH);
+   g_hRSI    = iRSI(_Symbol, _Period, 14, PRICE_CLOSE);
 
    // Create Timer for periodic WebRequest sync
    EventSetTimer(InpSyncIntervalSec);
@@ -89,8 +90,8 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-   IndicatorRelease(g_hEMA1);
-   IndicatorRelease(g_hEMA2);
+   IndicatorRelease(g_hEMA400);
+   IndicatorRelease(g_hStoch);
    IndicatorRelease(g_hRSI);
    Comment("");
 }
@@ -180,16 +181,6 @@ void OnTick()
             Print("🔄 EAxocial Recovery Grid BUY Executed: Lot ", nextLot);
          }
       }
-      else if(lastOrderType == POSITION_TYPE_SELL)
-      {
-         double distancePts = (currentBid - lastOrderOpenPrice) / point;
-         if(distancePts >= g_gridDistancePts)
-         {
-            double nextLot = NormalizeDouble(g_initialLot * MathPow(g_lotMultiplier, totalEaOrders), 2);
-            trade.Sell(nextLot, _Symbol, currentBid, 0, 0, "EAxocial Grid #" + IntegerToString(totalEaOrders + 1));
-            Print("🔄 EAxocial Recovery Grid SELL Executed: Lot ", nextLot);
-         }
-      }
       return;
    }
 
@@ -201,32 +192,63 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Evaluate Entry Conditions                                        |
+//| Evaluate Entry Conditions: Apex 400 Stoch Sniper (RR 1.5)        |
 //+------------------------------------------------------------------+
 void EvaluateEntrySignal()
 {
-   double ema1[], ema2[], rsi[];
-   ArraySetAsSeries(ema1, true);
-   ArraySetAsSeries(ema2, true);
-   ArraySetAsSeries(rsi, true);
+   double ema400[], stochK[], stochD[], closes[];
+   ArraySetAsSeries(ema400, true);
+   ArraySetAsSeries(stochK, true);
+   ArraySetAsSeries(stochD, true);
+   ArraySetAsSeries(closes, true);
 
-   if(CopyBuffer(g_hEMA1, 0, 1, 2, ema1) < 2) return;
-   if(CopyBuffer(g_hEMA2, 0, 1, 2, ema2) < 2) return;
-   if(CopyBuffer(g_hRSI, 0, 1, 2, rsi) < 2) return;
+   if(CopyBuffer(g_hEMA400, 0, 1, 2, ema400) < 2) return;
+   if(CopyBuffer(g_hStoch, 0, 1, 3, stochK) < 3) return; // Buffer 0: %K
+   if(CopyBuffer(g_hStoch, 1, 1, 3, stochD) < 3) return; // Buffer 1: %D
+   if(CopyClose(_Symbol, _Period, 1, 2, closes) < 2) return;
 
    double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
-   // Buy Signal: EMA 50 > EMA 200 and RSI < 45
-   if(ema1[0] > ema2[0] && rsi[0] < 45.0)
+   // Step 1: Price is Above EMA 400 (Uptrend Baseline)
+   bool cond1_emaUptrend = (closes[0] > ema400[0]);
+
+   // Step 2: Stoch was in Oversold Zone (Below 20)
+   bool cond2_stochOversold = (stochK[1] < g_stochOversold || stochK[2] < g_stochOversold);
+
+   // Step 3: %K crosses above %D
+   bool cond3_stochCrossUp = (stochK[0] > stochD[0] && stochK[1] <= stochD[1]);
+
+   if(cond1_emaUptrend && cond2_stochOversold && cond3_stochCrossUp)
    {
-      double sl = (g_stopLossPts > 0) ? (currentAsk - (g_stopLossPts * point)) : 0;
-      double tp = (g_takeProfitPts > 0) ? (currentAsk + (g_takeProfitPts * point)) : 0;
+      // Calculate Swing Low of past N bars for Stop Loss
+      double lows[];
+      ArraySetAsSeries(lows, true);
+      CopyLow(_Symbol, _Period, 1, g_swingLookback, lows);
       
-      if(trade.Buy(g_initialLot, _Symbol, currentAsk, sl, tp, "EAxocial Entry #1"))
+      double swingLow = lows[0];
+      for(int k = 1; k < g_swingLookback; k++)
       {
-         Print("🚀 EAxocial Entry BUY Executed: ", _Symbol, " Lot: ", g_initialLot);
+         if(lows[k] < swingLow) swingLow = lows[k];
+      }
+
+      double sl = swingLow - (10.0 * point); // SL slightly below swing low
+      double riskPoints = (currentAsk - sl) / point;
+
+      // Minimum SL distance sanity check (at least 150 points)
+      if(riskPoints < 150.0)
+      {
+         sl = currentAsk - (250.0 * point);
+         riskPoints = 250.0;
+      }
+
+      // Target Profit calculated by Risk-Reward Ratio (e.g. 1.5x)
+      double tp = currentAsk + (riskPoints * g_riskRewardRatio * point);
+
+      if(trade.Buy(g_initialLot, _Symbol, currentAsk, sl, tp, "Apex 400 Stoch #1"))
+      {
+         Print("🚀 Apex Stoch Sniper BUY Executed: ", _Symbol, " Lot: ", g_initialLot, 
+               " | SL: ", sl, " | TP (RR ", g_riskRewardRatio, "): ", tp);
          g_tradingState = "in_position";
          UpdateChartHUD();
       }
