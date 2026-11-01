@@ -1,919 +1,1826 @@
-'use client';
+"use client";
 
-import React, { useState } from 'react';
-import { 
-  Radar, 
-  Target, 
-  ShieldAlert, 
-  TrendingUp, 
-  Sliders, 
-  Sparkles, 
-  Share2, 
-  Send, 
-  CheckCircle2, 
-  AlertCircle,
-  Video,
-  Zap,
-  RotateCcw,
-  Cpu,
-  Plus,
-  Trash2,
-  LineChart,
-  Layers,
-  ArrowRight
-} from 'lucide-react';
-import { 
-  StrategyRecipe, 
-  IndicatorType, 
-  TriggerMode, 
-  RecoveryMode, 
-  ExitMode, 
-  EntryCondition, 
-  ComparisonOperator 
-} from '@/types/strategy';
-import { STARTER_PRESETS } from '@/lib/presets';
-import StrategySimulatorChart from '@/components/StrategySimulatorChart';
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { supabase } from "@/lib/supabase";
+import EntryPreviewChart from "./entry-preview-chart";
+import RuntimeExport from "./runtime-export";
+import "./builder.css";
+
+import type {
+  EntryModuleKind,
+  EntryModule,
+  EntryConditionGroup,
+  EntryTriggerKind,
+  EntryTrigger,
+  RecoveryPreset,
+  RecoveryConditionKind,
+  RecoveryCondition,
+  AddOrderRule,
+  ExitRuleKind,
+  ExitRule,
+  RecoveryConfig,
+  LotMode,
+  Strategy,
+} from "@/lib/strategy/model";
+import { fingerprint } from "@/lib/strategy/runtime";
+import { isEditableStrategy, validateStrategy } from "@/lib/strategy/validation";
+
+const STEPS = ["Entry", "Manage", "Exit", "Protection"] as const;
+
+const defaultEntryTrigger = (): EntryTrigger => ({ kind: "next_bar_open", maxWaitBars: 3 });
+
+const entryTriggerChoices: { id: EntryTriggerKind; label: string; description: string }[] = [
+  { id: "immediate", label: "ทันทีเมื่อพร้อม", description: "ส่ง Market order ที่ tick ถัดไปหลังสัญญาณ Setup ผ่าน" },
+  { id: "next_bar_open", label: "เปิดแท่งถัดไป", description: "รอแท่งปัจจุบันปิด แล้วเข้าในช่วงเริ่มแท่งใหม่" },
+  { id: "delay_seconds", label: "หน่วงเวลา", description: "รอครบเวลาที่กำหนด แล้วเข้าเมื่อ Setup ยังใช้ได้" },
+  { id: "price_move", label: "รอราคาขยับตามระยะ", description: "รอราคาเดินหน้าหรือสวนทางจากราคาตอน Setup พร้อม" },
+  { id: "break_signal_candle", label: "รอเบรก High/Low แท่งสัญญาณ", description: "เข้าเมื่อราคาทะลุขอบแท่งที่ทำให้ Setup พร้อม" },
+  { id: "pullback_to_ema", label: "รอย่อกลับถึง EMA", description: "รอราคาย่อแตะเส้น EMA ก่อนเข้า" },
+  { id: "manual", label: "รอยืนยันด้วยตนเอง", description: "แจ้งว่าพร้อมแล้ว แต่ยังไม่เข้าอัตโนมัติ" },
+];
+
+const moduleLabels: Record<EntryModuleKind, string> = {
+  ema: "EMA",
+  stochastic: "Stochastic",
+  rsi: "RSI",
+  ma_cross: "เส้นค่าเฉลี่ยตัดกัน",
+  price_cross: "ราคาตัดเส้นค่าเฉลี่ย",
+};
+
+function newEntryModule(kind: EntryModuleKind, stage: "signal" | "entry"): EntryModule {
+  if (kind === "ema") return { kind, period: 400, rule: "with_direction" };
+  if (kind === "stochastic")
+    return {
+      kind,
+      period: 15,
+      signalPeriod: 2,
+      slowPeriod: 9,
+      rule: stage === "signal" ? "zone_then_cross" : "cross_for_direction",
+      level: 20,
+      upperLevel: 80,
+      zoneLookbackBars: 10,
+    };
+  if (kind === "rsi") return { kind, period: 14, level: 30, upperLevel: 70, rule: "recover_for_direction" };
+  if (kind === "ma_cross") return { kind, fastPeriod: 20, slowPeriod: 50, averageType: "SMA", rule: "cross_for_direction" };
+  return { kind, period: 50, averageType: "EMA", target: "moving_average", rule: "cross_for_direction", level: 0 };
+}
+
+const defaultSignalGroup: EntryConditionGroup = {
+  logic: "all",
+  conditions: [
+    { kind: "ema", period: 400, rule: "with_direction" },
+    { kind: "stochastic", period: 15, signalPeriod: 2, slowPeriod: 9, rule: "zone_then_cross", level: 20, upperLevel: 80, zoneLookbackBars: 10 },
+  ],
+};
+
+const defaultFirstEntryGroup: EntryConditionGroup = {
+  logic: "all",
+  conditions: [{ kind: "stochastic", period: 15, signalPeriod: 2, slowPeriod: 9, rule: "cross_for_direction", level: 20, upperLevel: 80 }],
+};
+
+const defaults: Strategy = {
+  schemaVersion: 1,
+  strategyType: "gold_scalping_recovery",
+  name: "Gold M5 · EMA400 + Stochastic 2-Step",
+  symbol: "XAUUSD",
+  timeframe: "M5",
+  direction: "buy",
+  entry: {
+    type: "gold_stoch_pullback",
+    fastPeriod: 20,
+    slowPeriod: 50,
+    maPeriod: 50,
+    rsiPeriod: 14,
+    rsiLow: 30,
+    rsiHigh: 70,
+    stochasticKPeriod: 15,
+    stochasticDPeriod: 2,
+    stochasticSlowing: 9,
+    stochasticOversold: 20,
+    stochasticOverbought: 80,
+    emaFilterPeriod: 400,
+    trigger: defaultEntryTrigger(),
+    signalGroup: defaultSignalGroup,
+  },
+  manage: {
+    lotSize: 0.01,
+    maxPositions: 1,
+    mode: "single",
+    recovery: {
+      maxAdds: 3,
+      spacingPoints: 0,
+      lotMode: "fixed",
+      lotMultiplier: 1,
+      preset: "candle",
+      spacingMode: "fixed",
+      cooldownBars: 1,
+      confirmationTimeframe: "same",
+      trendFilter: "ema_slope",
+      rangeSignal: "band_reentry",
+      atrPeriod: 14,
+      atrMultiplier: 1,
+      pauseOnAtrExpansion: true,
+      maxWaitBars: 3,
+      orderRules: Array.from({ length: 3 }, () => ({ logic: "all", conditions: [{ kind: "candle_reversal" }], trigger: defaultEntryTrigger() })),
+    },
+  },
+  exit: {
+    stopLossPips: 30,
+    takeProfitPips: 60,
+    stopMode: "swing",
+    swingLookbackBars: 10,
+    swingBufferPoints: 0,
+    riskRewardRatio: 1.5,
+    basketStopLoss: 0,
+    basketTakeProfit: 0,
+  },
+  protection: { maxSpreadPoints: 30 },
+};
+
+const QUICK_STRATEGY_PRESETS: { id: string; label: string; create: () => Strategy }[] = [
+  {
+    id: "gold_stoch_2step",
+    label: "★ Gold EMA 400 + Stoch 2-Step (15,2,9 · SL Swing / RR 1.5)",
+    create: () => normalizeStrategy(defaults),
+  },
+  {
+    id: "ema_rsi_pullback",
+    label: "EMA 200 + RSI Pullback (< 30)",
+    create: () =>
+      normalizeStrategy({
+        ...defaults,
+        name: "Gold M15 · EMA200 + RSI Pullback",
+        timeframe: "M15",
+        direction: "buy",
+        entry: {
+          ...defaults.entry,
+          signalGroup: {
+            logic: "all",
+            conditions: [
+              { kind: "ema", period: 200, rule: "with_direction" },
+              { kind: "rsi", period: 14, level: 30, upperLevel: 70, rule: "recover_for_direction" },
+            ],
+          },
+          trigger: { kind: "next_bar_open", maxWaitBars: 3 },
+        },
+        exit: { ...defaults.exit, stopMode: "swing", swingLookbackBars: 10, riskRewardRatio: 2.0 },
+      }),
+  },
+  {
+    id: "ma_cross_breakout",
+    label: "MA Cross 20/50 + Break Signal Candle",
+    create: () =>
+      normalizeStrategy({
+        ...defaults,
+        name: "Gold H1 · SMA 20/50 Cross Breakout",
+        timeframe: "H1",
+        direction: "both",
+        entry: {
+          ...defaults.entry,
+          signalGroup: {
+            logic: "all",
+            conditions: [{ kind: "ma_cross", fastPeriod: 20, slowPeriod: 50, averageType: "SMA", rule: "cross_for_direction" }],
+          },
+          trigger: { kind: "break_signal_candle", bufferPoints: 5, maxWaitBars: 3 },
+        },
+        exit: { ...defaults.exit, stopMode: "fixed_pips", stopLossPips: 35, takeProfitPips: 70 },
+      }),
+  },
+];
+
+const recoveryPresets: { id: RecoveryPreset; title: string; description: string; details: string; signal: string }[] = [
+  { id: "distance", title: "เพิ่มตามระยะ", description: "ราคาสวนทางครบระยะแล้วจึงเพิ่มไม้", details: "ใช้ระยะราคาเป็น trigger หลัก ไม่มีสัญญาณยืนยันเพิ่มเติม", signal: "Distance only" },
+  { id: "candle", title: "รอแท่งยืนยัน", description: "ถึงระยะแล้วรอแท่งปิดยืนยันก่อนเพิ่ม", details: "ช่วยรอให้ราคาแสดงสัญญาณกลับทิศก่อนเปิดไม้แก้", signal: "Closed candle confirmation" },
+  { id: "trend", title: "กรองด้วย Trend ใหญ่", description: "เพิ่มเมื่อ Trend Filter อนุญาต", details: "เลือกวิธีอ่านแนวโน้มและ timeframe กรองได้ หากยังไม่ยืนยัน ระบบจะรอ", signal: "Higher timeframe trend filter" },
+  { id: "range", title: "เล่นกรอบ Sideway", description: "เพิ่มเมื่อราคาเริ่มกลับเข้ากรอบ", details: "รอสัญญาณกลับจากขอบกรอบหรือกลับเข้าช่องราคา และพักเมื่อกรอบแตก", signal: "Range re-entry / rejection" },
+  { id: "atr", title: "ATR ปรับระยะ", description: "ปรับระยะตามความผันผวนและพักเมื่อ ATR ขยาย", details: "ATR ใช้กำหนดระยะและเป็น volatility gate ไม่ได้บอกทิศทางราคา", signal: "ATR spacing + volatility pause" },
+  { id: "manual", title: "ยืนยันด้วยตนเอง", description: "ระบบรอให้คุณยืนยันก่อนเปิดไม้แก้", details: "เมื่อเงื่อนไขที่เลือกผ่าน ระบบจะแสดงสถานะรอยืนยัน แทนการเปิดทันที", signal: "Manual confirmation" },
+];
+
+const presetConditions: Record<Exclude<RecoveryPreset, "custom">, RecoveryConditionKind[]> = {
+  distance: [],
+  candle: ["candle_reversal"],
+  trend: ["trend_filter"],
+  range: ["range_reentry"],
+  atr: ["atr_gate"],
+  manual: ["manual_confirm"],
+};
+
+function newCondition(kind: RecoveryConditionKind): RecoveryCondition {
+  return {
+    kind,
+    timeframe: "same",
+    period: kind === "rsi_recovery" || kind === "atr_gate" ? 14 : undefined,
+    level: kind === "rsi_recovery" ? 30 : undefined,
+    method: kind === "trend_filter" ? "ema_slope" : kind === "range_reentry" ? "band_reentry" : undefined,
+  };
+}
+
+function makeOrderRules(preset: RecoveryPreset, count: number): AddOrderRule[] {
+  const kinds = preset === "custom" ? [] : presetConditions[preset];
+  return Array.from({ length: count }, () => ({ logic: "all" as const, conditions: kinds.map(newCondition), trigger: defaultEntryTrigger() }));
+}
+
+const exitRuleLabels: Record<ExitRuleKind, string> = {
+  average_target: "เป้ากำไรจากราคาเฉลี่ย",
+  trailing_average: "Trailing จากราคาเฉลี่ย",
+  partial_close: "ทยอยปิดบางส่วน",
+  time_limit: "ปิดเมื่อครบเวลา",
+  signal_exit: "ปิดเมื่อสัญญาณกลับทิศ",
+  manual_close: "รอผู้ใช้สั่งปิด",
+};
+
+const conditionLabels: Record<RecoveryConditionKind, string> = {
+  candle_reversal: "แท่งกลับตัว / Rejection",
+  trend_filter: "Trend Filter",
+  range_reentry: "กลับเข้ากรอบ Sideway",
+  atr_gate: "ATR / Volatility Gate",
+  rsi_recovery: "RSI กลับผ่านระดับ",
+  manual_confirm: "ผู้ใช้กดยืนยัน",
+};
+
+const entryModuleKinds: EntryModuleKind[] = ["ema", "stochastic", "rsi", "ma_cross", "price_cross"];
+const storageKey = "eaxocial.strategy.draft.v1";
+
+function num(value: string) {
+  return value === "" ? 0 : Number(value);
+}
+
+const triggerKinds: { id: EntryTriggerKind; label: string }[] = [
+  { id: "next_bar_open", label: "เข้าเมื่อต้นแท่งถัดไป" },
+  { id: "break_signal_candle", label: "รอราคาทะลุ High/Low ของแท่งสัญญาณ" },
+  { id: "pullback_to_ema", label: "รอราคาย่อกลับแตะ EMA" },
+  { id: "candle_reversal", label: "รอแท่งยืนยันกลับทิศปิด" },
+  { id: "manual", label: "รอผู้ใช้กดยืนยัน" },
+];
+
+function manageMode(s: Strategy): "single" | "recovery" {
+  return s.manage.mode ?? (s.manage.recovery?.maxAdds || s.manage.maxPositions > 1 ? "recovery" : "single");
+}
+function hasManageOptions(s: Strategy) {
+  return s.strategyType === "gold_scalping_recovery" || s.manage.mode !== undefined || s.manage.recovery !== undefined;
+}
+function usesBasketExit(s: Strategy) {
+  return hasManageOptions(s) && manageMode(s) === "recovery";
+}
+function recoveryPreset(s: Strategy): RecoveryPreset {
+  return s.manage.recovery?.preset ?? "distance";
+}
+
+function normalizeStrategy(s: Strategy): Strategy {
+  const withTriggers = (strategy: Strategy): Strategy => {
+    const recovery = strategy.manage.recovery;
+    const legacySignal =
+      strategy.entry.type === "ma_cross"
+        ? [{ kind: "ma_cross" as const, fastPeriod: strategy.entry.fastPeriod, slowPeriod: strategy.entry.slowPeriod, averageType: "SMA" as const, rule: "cross_for_direction" }]
+        : strategy.entry.type === "price_ma"
+          ? [{ kind: "price_cross" as const, period: strategy.entry.maPeriod, averageType: "SMA" as const, target: "moving_average" as const, rule: "cross_for_direction" }]
+          : strategy.entry.type === "rsi_recovery"
+            ? [{ kind: "rsi" as const, period: strategy.entry.rsiPeriod, level: strategy.entry.rsiLow, upperLevel: strategy.entry.rsiHigh, rule: "recover_for_direction" }]
+            : defaultSignalGroup.conditions;
+    const initialGroup = strategy.entry.signalGroup ?? { logic: "all" as const, conditions: legacySignal };
+    const oldGroup = strategy.entry.firstEntryGroup;
+    const mergeLegacy = oldGroup && oldGroup.logic === "all" && initialGroup.logic === "all";
+    return {
+      ...strategy,
+      contractVersion: "1.0.0",
+      entry: {
+        ...strategy.entry,
+        signalGroup: mergeLegacy ? { logic: "all", conditions: [...initialGroup.conditions, ...oldGroup.conditions] } : initialGroup,
+        firstEntryGroup: mergeLegacy ? undefined : oldGroup,
+        stochasticKPeriod: strategy.entry.stochasticKPeriod ?? 15,
+        stochasticDPeriod: strategy.entry.stochasticDPeriod ?? 2,
+        stochasticSlowing: strategy.entry.stochasticSlowing ?? 9,
+        stochasticOversold: strategy.entry.stochasticOversold ?? 20,
+        stochasticOverbought: strategy.entry.stochasticOverbought ?? 80,
+        emaFilterPeriod: strategy.entry.emaFilterPeriod ?? 400,
+        trigger: strategy.entry.trigger ?? defaultEntryTrigger(),
+      },
+      manage: {
+        ...strategy.manage,
+        ...(recovery
+          ? {
+              recovery: {
+                ...recovery,
+                orderRules: (recovery.orderRules ?? makeOrderRules(recovery.preset ?? "distance", recovery.maxAdds)).map(rule => ({
+                  ...rule,
+                  trigger: rule.trigger ?? defaultEntryTrigger(),
+                })),
+              },
+            }
+          : {}),
+      },
+    };
+  };
+  if (s.strategyType === "gold_scalping_recovery") {
+    const recovery: RecoveryConfig = {
+      maxAdds: 3,
+      spacingPoints: 0,
+      lotMode: "fixed",
+      lotMultiplier: 1,
+      preset: "distance",
+      spacingMode: "fixed",
+      cooldownBars: 1,
+      confirmationTimeframe: "same",
+      trendFilter: "ema_slope",
+      rangeSignal: "band_reentry",
+      atrPeriod: 14,
+      atrMultiplier: 1,
+      pauseOnAtrExpansion: true,
+      maxWaitBars: 3,
+      ...s.manage.recovery,
+    };
+    recovery.orderRules ??= makeOrderRules(recovery.preset ?? "distance", recovery.maxAdds);
+    return withTriggers({ ...s, manage: { ...s.manage, mode: s.manage.mode ?? (recovery.maxAdds ? "recovery" : "single"), recovery } });
+  }
+  if (s.manage.mode !== undefined || s.manage.recovery !== undefined) {
+    if (!s.manage.recovery) return withTriggers(s);
+    const recovery: RecoveryConfig = {
+      preset: "distance",
+      spacingMode: "fixed",
+      cooldownBars: 1,
+      confirmationTimeframe: "same",
+      trendFilter: "ema_slope",
+      rangeSignal: "band_reentry",
+      atrPeriod: 14,
+      atrMultiplier: 1,
+      pauseOnAtrExpansion: true,
+      maxWaitBars: 3,
+      ...s.manage.recovery,
+    };
+    recovery.orderRules ??= makeOrderRules(recovery.preset ?? "distance", recovery.maxAdds);
+    return withTriggers({ ...s, manage: { ...s.manage, recovery } });
+  }
+  if (s.manage.maxPositions > 4) return withTriggers(s);
+  const recovery: RecoveryConfig = {
+    maxAdds: Math.max(0, s.manage.maxPositions - 1),
+    spacingPoints: 0,
+    lotMode: "fixed",
+    lotMultiplier: 1,
+    preset: "distance",
+    spacingMode: "fixed",
+    cooldownBars: 1,
+    confirmationTimeframe: "same",
+    trendFilter: "ema_slope",
+    rangeSignal: "band_reentry",
+    atrPeriod: 14,
+    atrMultiplier: 1,
+    pauseOnAtrExpansion: true,
+    maxWaitBars: 3,
+  };
+  recovery.orderRules = makeOrderRules("distance", recovery.maxAdds);
+  return withTriggers({ ...s, manage: { ...s.manage, recovery } });
+}
+
+function validDraft(s: Strategy): string | null {
+  const errors = validateStrategy(s, true);
+  if (errors.length) return errors[0];
+  if (!s.name.trim() || !s.symbol.trim()) return "กรุณาใส่ชื่อ Strategy และสัญลักษณ์ที่ต้องการเทรด";
+  return null;
+}
+
+function valid(s: Strategy): string | null {
+  const draftError = validDraft(s);
+  if (draftError) return draftError;
+  const errors = validateStrategy(s, false);
+  if (errors.length) return errors[0];
+  return null;
+}
+
+function isDraft(value: unknown): value is Strategy {
+  return isEditableStrategy(value);
+}
 
 export default function BuilderPage() {
-  // Strategy Identity
-  const [strategyTitle, setStrategyTitle] = useState(STARTER_PRESETS[0].title);
-  const [symbol, setSymbol] = useState(STARTER_PRESETS[0].recipe.symbol);
-  const [timeframe, setTimeframe] = useState(STARTER_PRESETS[0].recipe.timeframe);
-  const [activeStepTab, setActiveStepTab] = useState<1 | 2 | 3 | 4>(1);
+  const [step, setStep] = useState(0);
+  const [strategy, setStrategy] = useState<Strategy>(() => normalizeStrategy(defaults));
+  const [activePresetId, setActivePresetId] = useState<string>("gold_stoch_2step");
+  const [notice, setNotice] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [strategyId, setStrategyId] = useState<string | null>(null);
+  const [isPublic, setIsPublic] = useState(false);
+  const [savedFingerprint, setSavedFingerprint] = useState<string | null>(null);
+  const [savedPublic, setSavedPublic] = useState(false);
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [signalModuleToAdd, setSignalModuleToAdd] = useState<EntryModuleKind>("rsi");
+  const [entryStage, setEntryStage] = useState<"signal" | "trigger">("signal");
 
-  // Core 4-Socket Recipe
-  const [recipe, setRecipe] = useState<StrategyRecipe>(STARTER_PRESETS[0].recipe);
-
-  // AI Modal State
-  const [isAiModalOpen, setIsAiModalOpen] = useState(false);
-  const [videoUrl, setVideoUrl] = useState('');
-  const [isAiExtracting, setIsAiExtracting] = useState(false);
-  const [aiSuccessMsg, setAiSuccessMsg] = useState('');
-
-  // Sync Notification State
-  const [syncStatus, setSyncStatus] = useState<string | null>(null);
-
-  // --- Handlers for Multi-Condition Entry ---
-  const handleAddCondition = (indicator: IndicatorType = 'STOCHASTIC') => {
-    const newCond: EntryCondition = {
-      id: 'cond_' + Date.now(),
-      indicator,
-      timeframe,
-      period: indicator === 'EMA' ? 400 : 14,
-      stochKPeriod: 15,
-      stochKSmoothing: 2,
-      stochDSmoothing: 9,
-      operator: indicator === 'STOCHASTIC' ? 'STOCH_K_CROSS_UP_D' : 'ABOVE',
-      thresholdValue: 20,
-      direction: 'BUY',
+  useEffect(() => {
+    let active = true;
+    async function loadRemote() {
+      const params = new URLSearchParams(window.location.search);
+      const id = params.get("id");
+      const copyId = params.get("copy");
+      const targetId = id ?? copyId;
+      if (!targetId) return;
+      const { data, error } = await supabase.from("strategies").select("id,config,is_public").eq("id", targetId).maybeSingle();
+      if (!active) return;
+      if (error || !data || !isDraft(data.config)) {
+        setNotice("ไม่พบ Strategy หรือไม่สามารถอ่านข้อมูลนี้ได้");
+        return;
+      }
+      setStrategy(normalizeStrategy(data.config));
+      if (copyId) {
+        setStrategyId(null);
+        setIsPublic(false);
+        setNotice("คัดลอกมาเป็นแบบร่างส่วนตัวแล้ว ปรับแก้ก่อนบันทึกลงบัญชีได้เลย");
+      } else {
+        setStrategyId(data.id);
+        setIsPublic(data.is_public ?? false);
+        setSavedFingerprint(fingerprint(data.config));
+        setSavedPublic(data.is_public ?? false);
+        setNotice("เปิด Strategy จากบัญชีแล้ว");
+      }
+    }
+    void loadRemote();
+    return () => {
+      active = false;
     };
-    setRecipe({
-      ...recipe,
-      entry: {
-        ...recipe.entry,
-        setupConditions: [...recipe.entry.setupConditions, newCond],
-      },
-    });
-  };
+  }, []);
 
-  const handleRemoveCondition = (index: number) => {
-    if (recipe.entry.setupConditions.length <= 1) {
-      alert('ต้องมีเงื่อนไขสัญญาณตรวจจับอย่างน้อย 1 รายการครับ');
+  async function saveRemote() {
+    const draftError = validDraft(strategy);
+    if (draftError) {
+      setNotice(draftError);
       return;
     }
-    const updated = recipe.entry.setupConditions.filter((_, i) => i !== index);
-    setRecipe({
-      ...recipe,
-      entry: {
-        ...recipe.entry,
-        setupConditions: updated,
-      },
-    });
-  };
-
-  const handleUpdateCondition = (index: number, updates: Partial<EntryCondition>) => {
-    const updated = [...recipe.entry.setupConditions];
-    updated[index] = { ...updated[index], ...updates };
-    setRecipe({
-      ...recipe,
-      entry: {
-        ...recipe.entry,
-        setupConditions: updated,
-      },
-    });
-  };
-
-  // Quick Preset Loader
-  const handleLoadPreset = (presetId: string) => {
-    const found = STARTER_PRESETS.find(p => p.id === presetId);
-    if (found) {
-      setStrategyTitle(found.title);
-      setSymbol(found.recipe.symbol);
-      setTimeframe(found.recipe.timeframe);
-      setRecipe(JSON.parse(JSON.stringify(found.recipe)));
-      setSyncStatus(`โหลดสูตร "${found.title}" เรียบร้อยแล้ว`);
-      setTimeout(() => setSyncStatus(null), 3000);
+    if (isPublic) {
+      const publishError = valid(strategy);
+      if (publishError) {
+        setNotice(publishError);
+        return;
+      }
     }
+    setRemoteBusy(true);
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) {
+        save();
+        setNotice("บันทึก Draft ลงเบราว์เซอร์แล้ว (เข้าสู่ระบบเพื่อบันทึกลง Cloud)");
+        return;
+      }
+      const payload = { name: strategy.name.trim(), config: strategy, is_public: isPublic };
+      if (strategyId) {
+        const { data, error } = await supabase.from("strategies").update(payload).eq("id", strategyId).select("id").maybeSingle();
+        if (error || !data) throw new Error("update failed");
+      } else {
+        const { data, error } = await supabase.from("strategies").insert({ ...payload, owner_id: user.id }).select("id").single();
+        if (error || !data) throw new Error("insert failed");
+        setStrategyId(data.id);
+        window.history.replaceState(null, "", `/builder?id=${encodeURIComponent(data.id)}`);
+      }
+      setSavedFingerprint(fingerprint(strategy));
+      setSavedPublic(isPublic);
+      setNotice(isPublic ? "บันทึกแล้ว · Strategy นี้แสดงใน Explore ให้ชุมชนเห็น" : "บันทึก Strategy ในบัญชีแล้ว · ยังเป็นส่วนตัว");
+    } catch {
+      save();
+    } finally {
+      setRemoteBusy(false);
+    }
+  }
+
+  async function handleSyncToMt5() {
+    const draftError = validDraft(strategy);
+    if (draftError) {
+      setNotice(draftError);
+      return;
+    }
+    setSyncBusy(true);
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(strategy));
+      setNotice(`⚡ Sync กลยุทธ์ "${strategy.name}" (${strategy.symbol} · ${strategy.timeframe}) พร้อมใช้งานบน MT5 แล้ว!`);
+    } catch {
+      setNotice("เกิดข้อผิดพลาดในการเตรียมข้อมูล Sync");
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  const updateEntryGroup = (groupKey: "signalGroup" | "firstEntryGroup", patch: Partial<EntryConditionGroup>) =>
+    setStrategy(s => {
+      const fallback = groupKey === "signalGroup" ? defaultSignalGroup : defaultFirstEntryGroup;
+      return { ...s, entry: { ...s.entry, [groupKey]: { ...fallback, ...s.entry[groupKey], ...patch } } };
+    });
+
+  const updateEntryModule = (groupKey: "signalGroup" | "firstEntryGroup", index: number, module: EntryModule) =>
+    setStrategy(s => {
+      const fallback = groupKey === "signalGroup" ? defaultSignalGroup : defaultFirstEntryGroup;
+      const group = s.entry[groupKey] ?? fallback;
+      return {
+        ...s,
+        entry: {
+          ...s.entry,
+          [groupKey]: { ...group, conditions: group.conditions.map((item, itemIndex) => (itemIndex === index ? module : item)) },
+        },
+      };
+    });
+
+  const addEntryModule = (groupKey: "signalGroup" | "firstEntryGroup", kind: EntryModuleKind) =>
+    setStrategy(s => {
+      const fallback = groupKey === "signalGroup" ? defaultSignalGroup : defaultFirstEntryGroup;
+      const group = s.entry[groupKey] ?? fallback;
+      return {
+        ...s,
+        entry: {
+          ...s.entry,
+          [groupKey]: { ...group, conditions: [...group.conditions, newEntryModule(kind, groupKey === "signalGroup" ? "signal" : "entry")] },
+        },
+      };
+    });
+
+  const removeEntryModule = (groupKey: "signalGroup" | "firstEntryGroup", index: number) =>
+    setStrategy(s => {
+      const fallback = groupKey === "signalGroup" ? defaultSignalGroup : defaultFirstEntryGroup;
+      const group = s.entry[groupKey] ?? fallback;
+      return {
+        ...s,
+        entry: {
+          ...s.entry,
+          [groupKey]: { ...group, conditions: group.conditions.filter((_, itemIndex) => itemIndex !== index) },
+        },
+      };
+    });
+
+  const updateRecovery = (patch: Partial<RecoveryConfig>) =>
+    setStrategy(s => {
+      const current: RecoveryConfig = {
+        maxAdds: 3,
+        spacingPoints: 0,
+        lotMode: "fixed",
+        lotMultiplier: 1,
+        preset: "candle",
+        spacingMode: "fixed",
+        cooldownBars: 1,
+        confirmationTimeframe: "same",
+        trendFilter: "ema_slope",
+        rangeSignal: "band_reentry",
+        atrPeriod: 14,
+        atrMultiplier: 1,
+        pauseOnAtrExpansion: true,
+        maxWaitBars: 3,
+        ...s.manage.recovery,
+      };
+      const next: RecoveryConfig = { ...current, ...patch };
+      if (patch.maxAdds !== undefined) {
+        const rules = [...(next.orderRules ?? makeOrderRules(next.preset ?? "distance", next.maxAdds))];
+        while (rules.length < next.maxAdds)
+          rules.push({
+            logic: "all",
+            conditions: (next.preset === "custom" ? [] : presetConditions[next.preset ?? "distance"]).map(newCondition),
+            trigger: defaultEntryTrigger(),
+          });
+        next.orderRules = rules.slice(0, next.maxAdds);
+      }
+      return { ...s, manage: { ...s.manage, ...(patch.maxAdds !== undefined ? { maxPositions: patch.maxAdds + 1 } : {}), recovery: next } };
+    });
+
+  const selectRecoveryPreset = (preset: RecoveryPreset) => {
+    const count = strategy.manage.recovery?.maxAdds ?? 3;
+    updateRecovery({ preset, orderRules: makeOrderRules(preset, count), spacingMode: preset === "atr" ? "atr" : "fixed" });
   };
 
-  const handlePushToMt5 = async () => {
-    setSyncStatus('กำลังส่งสัญญาณ Sync ไปยัง MT5 Terminal...');
-    setTimeout(() => {
-      setSyncStatus('🟢 Sync สำเร็จ! พารามิเตอร์ถูกส่งต่อไปยัง Universal EA บน MT5 เรียบร้อยแล้ว');
-      setTimeout(() => setSyncStatus(null), 4000);
-    }, 600);
-  };
+  const updateOrderRule = (orderIndex: number, patch: Partial<AddOrderRule>) =>
+    setStrategy(s => {
+      const recovery = s.manage.recovery;
+      if (!recovery) return s;
+      const orderRules = [...(recovery.orderRules ?? makeOrderRules(recovery.preset ?? "distance", recovery.maxAdds))];
+      orderRules[orderIndex] = { ...orderRules[orderIndex], ...patch };
+      return { ...s, manage: { ...s.manage, recovery: { ...recovery, orderRules } } };
+    });
 
-  return (
-    <div className="space-y-8 animate-fade-in pb-12">
-      {/* Top Header & Strategy Identity */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 glass-panel p-6 rounded-2xl border-cyan-500/20">
-        <div className="space-y-1">
-          <div className="flex items-center gap-2">
-            <span className="px-2.5 py-0.5 rounded-full text-xs font-mono font-semibold bg-cyan-950 border border-cyan-500/40 text-cyan-300">
-              MODULAR CORE v2.0
-            </span>
-            <span className="text-xs text-slate-400 font-mono">
-              Multi-Signal & Simulated Candlesticks
-            </span>
+  const updateOrderTrigger = (orderIndex: number, patch: Partial<EntryTrigger>) =>
+    setStrategy(s => {
+      const recovery = s.manage.recovery;
+      if (!recovery) return s;
+      const orderRules = [...(recovery.orderRules ?? makeOrderRules(recovery.preset ?? "distance", recovery.maxAdds))];
+      const rule = orderRules[orderIndex];
+      orderRules[orderIndex] = { ...rule, trigger: { ...defaultEntryTrigger(), ...rule.trigger, ...patch } };
+      return { ...s, manage: { ...s.manage, recovery: { ...recovery, orderRules } } };
+    });
+
+  const updateOrderCondition = (orderIndex: number, conditionIndex: number, condition: RecoveryCondition) =>
+    setStrategy(s => {
+      const recovery = s.manage.recovery;
+      if (!recovery) return s;
+      const orderRules = [...(recovery.orderRules ?? makeOrderRules(recovery.preset ?? "distance", recovery.maxAdds))];
+      const rule = orderRules[orderIndex];
+      orderRules[orderIndex] = {
+        ...rule,
+        conditions: rule.conditions.map((item, index) => (index === conditionIndex ? condition : item)),
+      };
+      return { ...s, manage: { ...s.manage, recovery: { ...recovery, orderRules } } };
+    });
+
+  const addOrderCondition = (orderIndex: number) =>
+    setStrategy(s => {
+      const recovery = s.manage.recovery;
+      if (!recovery) return s;
+      const orderRules = [...(recovery.orderRules ?? makeOrderRules(recovery.preset ?? "distance", recovery.maxAdds))];
+      const rule = orderRules[orderIndex];
+      orderRules[orderIndex] = { ...rule, conditions: [...rule.conditions, newCondition("candle_reversal")] };
+      return { ...s, manage: { ...s.manage, recovery: { ...recovery, orderRules } } };
+    });
+
+  const removeOrderCondition = (orderIndex: number, conditionIndex: number) =>
+    setStrategy(s => {
+      const recovery = s.manage.recovery;
+      if (!recovery) return s;
+      const orderRules = [...(recovery.orderRules ?? makeOrderRules(recovery.preset ?? "distance", recovery.maxAdds))];
+      const rule = orderRules[orderIndex];
+      orderRules[orderIndex] = { ...rule, conditions: rule.conditions.filter((_, index) => index !== conditionIndex) };
+      return { ...s, manage: { ...s.manage, recovery: { ...recovery, orderRules } } };
+    });
+
+  const updateExitRule = (index: number, patch: Partial<ExitRule>) =>
+    setStrategy(s => ({
+      ...s,
+      exit: { ...s.exit, closeRules: (s.exit.closeRules ?? []).map((rule, ruleIndex) => (ruleIndex === index ? { ...rule, ...patch } : rule)) },
+    }));
+  const addExitRule = () =>
+    setStrategy(s => ({ ...s, exit: { ...s.exit, closeRules: [...(s.exit.closeRules ?? []), { kind: "average_target", value: 0 }] } }));
+  const removeExitRule = (index: number) =>
+    setStrategy(s => ({ ...s, exit: { ...s.exit, closeRules: (s.exit.closeRules ?? []).filter((_, ruleIndex) => ruleIndex !== index) } }));
+
+  const summarizeGroup = (group?: EntryConditionGroup) =>
+    group?.conditions
+      .map(item =>
+        item.kind === "ema"
+          ? `EMA ${item.period ?? 400}`
+          : item.kind === "stochastic"
+            ? `Stoch ${item.period ?? 15}/${item.signalPeriod ?? 2}/${item.slowPeriod ?? 9}`
+            : item.kind === "rsi"
+              ? `RSI ${item.period ?? 14}`
+              : item.kind === "ma_cross"
+                ? `${item.averageType ?? "SMA"} ${item.fastPeriod ?? 20}/${item.slowPeriod ?? 50} cross`
+                : item.target === "price_level"
+                  ? `Price × ${item.level ?? "level"}`
+                  : `Price × ${item.averageType ?? "EMA"} ${item.period ?? 50}`,
+      )
+      .join(" + ") || "ยังไม่ตั้ง";
+
+  const summary = `Setup: ${summarizeGroup(strategy.entry.signalGroup)} · Trigger: ${
+    entryTriggerChoices.find(item => item.id === (strategy.entry.trigger ?? defaultEntryTrigger()).kind)?.label ?? "เปิดแท่งถัดไป"
+  }`;
+
+  const exitSummary = usesBasketExit(strategy)
+    ? `Basket SL ${strategy.exit.basketStopLoss || "ยังไม่ตั้ง"} · TP ${strategy.exit.basketTakeProfit || "ยังไม่ตั้ง"} · ${
+        strategy.exit.closeRules?.length ?? 0
+      } วิธีเสริม`
+    : strategy.exit.stopMode === "swing"
+      ? `SL Swing · TP ${strategy.exit.riskRewardRatio ?? 1.5}R`
+      : `SL ${strategy.exit.stopLossPips} / TP ${strategy.exit.takeProfitPips} pips`;
+
+  function save() {
+    const error = validDraft(strategy);
+    if (error) {
+      setNotice(error);
+      return;
+    }
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(strategy));
+      setNotice("บันทึก draft ในเบราว์เซอร์นี้แล้ว");
+      setLoaded(true);
+    } catch {
+      setNotice("บันทึกไม่ได้ กรุณาตรวจสอบพื้นที่จัดเก็บของเบราว์เซอร์");
+    }
+  }
+
+  function load() {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (!raw) {
+        setNotice("ยังไม่มี draft ที่บันทึกในเบราว์เซอร์นี้");
+        return;
+      }
+      const data: unknown = JSON.parse(raw);
+      if (!isDraft(data)) {
+        setNotice("ไม่สามารถอ่าน draft นี้ได้ กรุณาสร้าง draft ใหม่");
+        return;
+      }
+      setStrategy(normalizeStrategy(data));
+      setStrategyId(null);
+      setIsPublic(false);
+      setSavedFingerprint(null);
+      setSavedPublic(false);
+      window.history.replaceState(null, "", "/builder");
+      setNotice("โหลด draft ในเบราว์เซอร์แล้ว · ปรับแต่งต่อได้ทันที");
+      setLoaded(true);
+    } catch {
+      setNotice("ไม่สามารถอ่าน draft จากเบราว์เซอร์นี้ได้");
+    }
+  }
+
+  const field = (label: string, value: number, onChange: (n: number) => void, suffix: string, min = 1, increment = 1) => (
+    <label className="builder-field">
+      <span>{label}</span>
+      <span className="input-wrap">
+        <input type="number" min={min} step={increment} value={value || ""} onChange={e => onChange(num(e.target.value))} />
+        <small>{suffix}</small>
+      </span>
+    </label>
+  );
+
+  const entryModuleEditor = (module: EntryModule, onChange: (next: EntryModule) => void) => (
+    <>
+      {module.kind === "ema" && (
+        <>
+          <div className="field-grid">
+            {field("EMA Period", module.period ?? 400, n => onChange({ ...module, period: n }), "แท่ง", 1)}
+            <label className="builder-field">
+              <span>เงื่อนไข</span>
+              <span className="input-wrap">
+                <select value={module.rule ?? "with_direction"} onChange={e => onChange({ ...module, rule: e.target.value })}>
+                  <option value="with_direction">ราคาอยู่ฝั่งเดียวกับทิศทางเทรด</option>
+                  <option value="price_above">ราคาปิดอยู่เหนือ EMA</option>
+                  <option value="price_below">ราคาปิดอยู่ใต้ EMA</option>
+                  <option value="slope_with_direction">ความชัน EMA ไปตามทิศทางเทรด</option>
+                </select>
+              </span>
+            </label>
           </div>
-          <div className="flex items-center gap-3">
-            <Cpu className="w-6 h-6 text-cyan-400" />
-            <input
-              type="text"
-              value={strategyTitle}
-              onChange={(e) => setStrategyTitle(e.target.value)}
-              className="bg-transparent text-xl sm:text-2xl font-bold tracking-tight text-white focus:outline-none border-b border-transparent focus:border-cyan-500 px-1"
-            />
+          <p className="module-hint">ตัวอย่าง: Buy ใช้ราคาเหนือ EMA และ Sell ใช้ราคาใต้ EMA เมื่อเลือกตามทิศทาง</p>
+        </>
+      )}
+      {module.kind === "stochastic" && (
+        <>
+          <div className="field-grid">
+            {field("%K Period", module.period ?? 15, n => onChange({ ...module, period: n }), "แท่ง", 1)}
+            {field("%D Period", module.signalPeriod ?? 2, n => onChange({ ...module, signalPeriod: n }), "แท่ง", 1)}
+            {field("Slowing", module.slowPeriod ?? 9, n => onChange({ ...module, slowPeriod: n }), "แท่ง", 1)}
+            <label className="builder-field">
+              <span>เงื่อนไข</span>
+              <span className="input-wrap">
+                <select value={module.rule ?? "cross_for_direction"} onChange={e => onChange({ ...module, rule: e.target.value })}>
+                  <option value="cross_for_direction">%K ตัด %D ตามทิศทาง</option>
+                  <option value="zone_then_cross">เข้าโซนก่อน แล้วรอ %K ตัด %D (2 ขั้น)</option>
+                  <option value="extreme_for_direction">อยู่ในโซนต่ำ/สูงตามทิศทาง</option>
+                  <option value="k_above_d">%K อยู่เหนือ %D</option>
+                  <option value="k_below_d">%K อยู่ใต้ %D</option>
+                </select>
+              </span>
+            </label>
+            {(module.rule === "extreme_for_direction" || module.rule === "zone_then_cross") && (
+              <>
+                {field("โซนต่ำ / Buy", module.level ?? 20, n => onChange({ ...module, level: n }), "0–100", 1, 1)}
+                {field("โซนสูง / Sell", module.upperLevel ?? 80, n => onChange({ ...module, upperLevel: n }), "0–100", 1, 1)}
+              </>
+            )}
+            {module.rule === "zone_then_cross" &&
+              field("รอตัดหลังเข้าโซนไม่เกิน", module.zoneLookbackBars ?? 10, n => onChange({ ...module, zoneLookbackBars: n }), "แท่งปิด", 1)}
           </div>
+          {module.rule === "zone_then_cross" ? (
+            <div className="stoch-steps">
+              <strong>เงื่อนไข Stochastic สองขั้น · ตรวจเมื่อแท่งปิด</strong>
+              <ol>
+                <li>
+                  ขั้นแรก: Buy รอ %K ต่ำกว่า {module.level ?? 20} · Sell รอ %K สูงกว่า {module.upperLevel ?? 80}
+                </li>
+                <li>ขั้นที่สอง: Buy รอ %K ตัดขึ้นเหนือ %D · Sell รอ %K ตัดลงใต้ %D</li>
+              </ol>
+              <p>
+                ถ้า %K กลับเหนือ {module.level ?? 20} (Buy) หรือกลับต่ำกว่า {module.upperLevel ?? 80} (Sell) ก่อนเกิดจุดตัด จะยกเลิกและรอขั้นแรกใหม่ ·
+                หากตัดและออกจากโซนในแท่งเดียวกัน ให้ถือว่าผ่าน · จากนั้นใช้ Entry Trigger ที่เลือก
+              </p>
+            </div>
+          ) : (
+            <p className="module-hint">เงื่อนไขตรวจจากแท่งปิด แล้วใช้ Entry Trigger ที่เลือก</p>
+          )}
+        </>
+      )}
+      {module.kind === "rsi" && (
+        <>
+          <div className="field-grid">
+            {field("RSI Period", module.period ?? 14, n => onChange({ ...module, period: n }), "แท่ง", 1)}
+            {field("ระดับต่ำ", module.level ?? 30, n => onChange({ ...module, level: n }), "0–100", 1, 1)}
+            {field("ระดับสูง", module.upperLevel ?? 70, n => onChange({ ...module, upperLevel: n }), "0–100", 1, 1)}
+            <label className="builder-field">
+              <span>เงื่อนไข</span>
+              <span className="input-wrap">
+                <select value={module.rule ?? "recover_for_direction"} onChange={e => onChange({ ...module, rule: e.target.value })}>
+                  <option value="recover_for_direction">กลับจากเขตต่ำ/สูงตามทิศทาง</option>
+                  <option value="cross_above_level">ตัดขึ้นเหนือระดับต่ำ</option>
+                  <option value="cross_below_level">ตัดลงต่ำกว่าระดับสูง</option>
+                  <option value="above_level">อยู่เหนือระดับ</option>
+                  <option value="below_level">อยู่ต่ำกว่าระดับ</option>
+                </select>
+              </span>
+            </label>
+          </div>
+        </>
+      )}
+      {module.kind === "ma_cross" && (
+        <>
+          <div className="field-grid">
+            {field("Period เส้นเร็ว", module.fastPeriod ?? 20, n => onChange({ ...module, fastPeriod: n }), "แท่ง", 1)}
+            {field("Period เส้นช้า", module.slowPeriod ?? 50, n => onChange({ ...module, slowPeriod: n }), "แท่ง", 1)}
+            <label className="builder-field">
+              <span>ประเภทเส้น</span>
+              <span className="input-wrap">
+                <select value={module.averageType ?? "SMA"} onChange={e => onChange({ ...module, averageType: e.target.value as "SMA" | "EMA" })}>
+                  <option value="SMA">SMA</option>
+                  <option value="EMA">EMA</option>
+                </select>
+              </span>
+            </label>
+            <label className="builder-field">
+              <span>เงื่อนไข</span>
+              <span className="input-wrap">
+                <select value={module.rule ?? "cross_for_direction"} onChange={e => onChange({ ...module, rule: e.target.value })}>
+                  <option value="cross_for_direction">เส้นเร็วตัดตามทิศทางเทรด</option>
+                  <option value="cross_up">เส้นเร็วตัดขึ้น</option>
+                  <option value="cross_down">เส้นเร็วตัดลง</option>
+                </select>
+              </span>
+            </label>
+          </div>
+        </>
+      )}
+      {module.kind === "price_cross" && (
+        <>
+          <div className="field-grid">
+            <label className="builder-field">
+              <span>ราคาตัดอะไร</span>
+              <span className="input-wrap">
+                <select
+                  value={module.target ?? "moving_average"}
+                  onChange={e => onChange({ ...module, target: e.target.value as EntryModule["target"] })}
+                >
+                  <option value="moving_average">เส้นค่าเฉลี่ย</option>
+                  <option value="price_level">ระดับราคาที่กำหนด</option>
+                </select>
+              </span>
+            </label>
+            {module.target === "price_level" ? (
+              field("ระดับราคา", module.level ?? 0, n => onChange({ ...module, level: n }), "ราคา", 0.01, 0.01)
+            ) : (
+              <>
+                {field("MA Period", module.period ?? 50, n => onChange({ ...module, period: n }), "แท่ง", 1)}
+                <label className="builder-field">
+                  <span>ประเภทเส้น</span>
+                  <span className="input-wrap">
+                    <select value={module.averageType ?? "EMA"} onChange={e => onChange({ ...module, averageType: e.target.value as "SMA" | "EMA" })}>
+                      <option value="SMA">SMA</option>
+                      <option value="EMA">EMA</option>
+                    </select>
+                  </span>
+                </label>
+              </>
+            )}
+            <label className="builder-field">
+              <span>เงื่อนไข</span>
+              <span className="input-wrap">
+                <select value={module.rule ?? "cross_for_direction"} onChange={e => onChange({ ...module, rule: e.target.value })}>
+                  <option value="cross_for_direction">ราคาตัดตามทิศทางเทรด</option>
+                  <option value="cross_up">ราคาตัดขึ้น</option>
+                  <option value="cross_down">ราคาตัดลง</option>
+                </select>
+              </span>
+            </label>
+          </div>
+        </>
+      )}
+    </>
+  );
+
+  const renderEntryGroup = (
+    groupKey: "signalGroup" | "firstEntryGroup",
+    title: string,
+    description: string,
+    moduleToAdd: EntryModuleKind,
+    setModuleToAdd: (module: EntryModuleKind) => void,
+  ) => {
+    const fallback = groupKey === "signalGroup" ? defaultSignalGroup : defaultFirstEntryGroup;
+    const group = strategy.entry[groupKey] ?? fallback;
+    return (
+      <section className="entry-condition-group" aria-label={title}>
+        <div className="entry-group-heading">
+          <div>
+            <span className="phase-label">{groupKey === "signalGroup" ? "จังหวะ 1 · Setup" : "จังหวะ 2 · Trigger"}</span>
+            <h3>{title}</h3>
+            <p>{description}</p>
+          </div>
+          <span className="module-count">{group.conditions.length} เงื่อนไข</span>
         </div>
-
-        {/* Global Controls & Asset Selection */}
-        <div className="flex flex-wrap items-center gap-2.5">
-          <div className="flex items-center gap-2 bg-slate-900/80 px-3 py-1.5 rounded-xl border border-slate-700/60 text-xs">
-            <span className="text-slate-400">Asset:</span>
-            <select
-              value={symbol}
-              onChange={(e) => setSymbol(e.target.value)}
-              className="bg-transparent font-bold text-cyan-400 focus:outline-none cursor-pointer"
-            >
-              <option value="XAUUSD">XAUUSD (Gold)</option>
-              <option value="EURUSD">EURUSD</option>
-              <option value="GBPUSD">GBPUSD</option>
-              <option value="BTCUSD">BTCUSD</option>
-            </select>
-          </div>
-
-          <div className="flex items-center gap-2 bg-slate-900/80 px-3 py-1.5 rounded-xl border border-slate-700/60 text-xs">
-            <span className="text-slate-400">TF:</span>
-            <select
-              value={timeframe}
-              onChange={(e) => setTimeframe(e.target.value)}
-              className="bg-transparent font-bold text-cyan-400 focus:outline-none cursor-pointer"
-            >
-              <option value="M1">M1 (Scalp)</option>
-              <option value="M5">M5 (Day-Trade)</option>
-              <option value="M15">M15 (Standard)</option>
-              <option value="H1">H1 (Swing)</option>
-            </select>
-          </div>
-
+        <div className="field-grid entry-group-logic">
+          <label className="builder-field">
+            <span>รวมเงื่อนไข</span>
+            <span className="input-wrap">
+              <select value={group.logic} onChange={e => updateEntryGroup(groupKey, { logic: e.target.value as "all" | "any" })}>
+                <option value="all">ALL · ต้องผ่านทุกข้อ</option>
+                <option value="any">ANY · ผ่านข้อใดก็ได้</option>
+              </select>
+            </span>
+          </label>
+        </div>
+        <div className="entry-module-list">
+          {group.conditions.map((module, index) => (
+            <article className="entry-module-card" key={`${groupKey}-${index}`}>
+              <div className="condition-row-heading">
+                <div>
+                  <strong>
+                    {index + 1}. {moduleLabels[module.kind]}
+                  </strong>
+                  <small>หนึ่งโมดูลต่อหนึ่ง Indicator/กติกา</small>
+                </div>
+                <button type="button" className="remove-condition" onClick={() => removeEntryModule(groupKey, index)}>
+                  ลบ
+                </button>
+              </div>
+              {entryModuleEditor(module, next => updateEntryModule(groupKey, index, next))}
+            </article>
+          ))}
+        </div>
+        <div className="entry-module-adder">
+          <label className="builder-field">
+            <span>เลือกโมดูลที่จะเพิ่ม</span>
+            <span className="input-wrap">
+              <select value={moduleToAdd} onChange={e => setModuleToAdd(e.target.value as EntryModuleKind)}>
+                {entryModuleKinds.map(kind => (
+                  <option key={kind} value={kind}>
+                    {moduleLabels[kind]}
+                  </option>
+                ))}
+              </select>
+            </span>
+          </label>
           <button
-            onClick={() => setIsAiModalOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-purple-950/80 border border-purple-500/40 text-purple-200 hover:text-white text-xs font-semibold transition-all"
+            type="button"
+            className="add-condition-button"
+            disabled={group.conditions.length >= 12}
+            onClick={() => addEntryModule(groupKey, moduleToAdd)}
           >
-            <Video className="w-3.5 h-3.5 text-pink-400" />
-            AI Video Extract
+            ＋ เพิ่มโมดูลในกลุ่มนี้
           </button>
         </div>
-      </div>
+      </section>
+    );
+  };
 
-      {/* Quick Preset Selector Pills */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-1 text-xs">
-        <span className="text-slate-400 text-[11px] font-mono shrink-0">สูตรยอดนิยม:</span>
-        <button
-          onClick={() => handleLoadPreset('strat-stoch-ema400')}
-          className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyan-950/70 border border-cyan-400/50 text-cyan-300 font-bold hover:bg-cyan-900/50 transition-all"
-        >
-          <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-          Apex 400 Stoch Sniper (RR 1.5)
-        </button>
-        <button
-          onClick={() => handleLoadPreset('strat-golden-trend')}
-          className="shrink-0 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:border-slate-700 transition-all"
-        >
-          Golden Trend (EMA 50/200)
-        </button>
-        <button
-          onClick={() => handleLoadPreset('strat-quantum-grid')}
-          className="shrink-0 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:border-slate-700 transition-all"
-        >
-          Quantum Grid (DCA Cashflow)
-        </button>
-      </div>
+  const triggerSettings = (trigger: EntryTrigger, onChange: (patch: Partial<EntryTrigger>) => void) => (
+    <>
+      <label className="builder-field">
+        <span>เงื่อนไขจังหวะที่ 2 · เข้าไม้เมื่อ</span>
+        <span className="input-wrap">
+          <select value={trigger.kind} onChange={e => onChange({ kind: e.target.value as EntryTriggerKind })}>
+            {triggerKinds.map(item => (
+              <option key={item.id} value={item.id}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+        </span>
+      </label>
+      {trigger.kind === "pullback_to_ema" && field("EMA สำหรับรอจังหวะย่อ", trigger.emaPeriod ?? 50, n => onChange({ emaPeriod: n }), "period", 1)}
+      {trigger.kind === "break_signal_candle" &&
+        field("Buffer เหนือ/ใต้แท่งสัญญาณ", trigger.bufferPoints ?? 0, n => onChange({ bufferPoints: n }), "points", 0, 0.1)}
+      {trigger.kind !== "next_bar_open" &&
+        trigger.kind !== "manual" &&
+        field("ยกเลิกสัญญาณหลัง", trigger.maxWaitBars ?? 3, n => onChange({ maxWaitBars: n }), "แท่ง", 1)}
+      {trigger.kind === "manual" && field("ยกเลิกคำขอหลัง", trigger.maxWaitBars ?? 3, n => onChange({ maxWaitBars: n }), "แท่ง", 1)}
+      <p className="signal-explanation">
+        สัญญาณพร้อมแล้วจะรอเงื่อนไขนี้ก่อนเข้า · หากไม่เกิดภายในเวลาที่กำหนด ให้ยกเลิกสัญญาณเพื่อไม่ไล่ราคาทีหลัง
+      </p>
+    </>
+  );
 
-      {/* Sync Status Banner */}
-      {syncStatus && (
-        <div className="p-4 rounded-xl bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 text-sm flex items-center gap-2">
-          <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
-          <span>{syncStatus}</span>
+  const entryTriggerSettings = (trigger: EntryTrigger, onChange: (patch: Partial<EntryTrigger>) => void) => (
+    <section className="entry-condition-group entry-trigger-settings" aria-label="จังหวะเข้าไม้แรก">
+      <div className="entry-group-heading">
+        <div>
+          <span className="phase-label">จังหวะ 2 · Trigger</span>
+          <h3>เข้าไม้แรกเมื่อใด</h3>
+          <p>Setup ผ่านแล้ว จากนั้นใช้กติกานี้กำหนดจังหวะส่งคำสั่ง โดยไม่ต้องเพิ่ม Indicator ในขั้นนี้</p>
+        </div>
+      </div>
+      <label className="builder-field">
+        <span>เลือกรูปแบบจังหวะเข้า</span>
+        <span className="input-wrap">
+          <select value={trigger.kind} onChange={e => onChange({ kind: e.target.value as EntryTriggerKind })}>
+            {entryTriggerChoices.map(item => (
+              <option key={item.id} value={item.id}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+        </span>
+      </label>
+      <p className="trigger-description">{entryTriggerChoices.find(item => item.id === trigger.kind)?.description}</p>
+      {trigger.kind === "delay_seconds" && field("หน่วงเวลาก่อนเข้า", trigger.delaySeconds ?? 10, n => onChange({ delaySeconds: n }), "วินาที", 1)}
+      {trigger.kind === "price_move" && (
+        <div className="field-grid">
+          {field("ระยะจากจุด Setup", trigger.priceMovePoints ?? 10, n => onChange({ priceMovePoints: n }), "points", 0.1, 0.1)}
+          <label className="builder-field">
+            <span>ทิศทางการขยับ</span>
+            <span className="input-wrap">
+              <select
+                value={trigger.moveDirection ?? "favorable"}
+                onChange={e => onChange({ moveDirection: e.target.value as "favorable" | "adverse" })}
+              >
+                <option value="favorable">ไปตามทิศทางเทรด</option>
+                <option value="adverse">สวนทางจากจุด Setup</option>
+              </select>
+            </span>
+          </label>
         </div>
       )}
+      {trigger.kind === "pullback_to_ema" && (
+        <div className="field-grid">
+          {field("EMA สำหรับรอจังหวะย่อ", trigger.emaPeriod ?? 50, n => onChange({ emaPeriod: n }), "period", 1)}
+          {field("Buffer จาก EMA", trigger.bufferPoints ?? 0, n => onChange({ bufferPoints: n }), "points", 0, 0.1)}
+        </div>
+      )}
+      {trigger.kind === "break_signal_candle" &&
+        field("Buffer เหนือ/ใต้แท่งสัญญาณ", trigger.bufferPoints ?? 0, n => onChange({ bufferPoints: n }), "points", 0, 0.1)}
+      {trigger.kind !== "immediate" &&
+        trigger.kind !== "next_bar_open" &&
+        field("ยกเลิกสัญญาณหลัง", trigger.maxWaitBars ?? 3, n => onChange({ maxWaitBars: n }), "แท่ง", 1)}
+      <p className="signal-explanation">นี่คือภาพประกอบจากกราฟจำลองเท่านั้น · ระบบจริงต้องยกเลิกสัญญาณเมื่อหมดอายุหรือ Setup ไม่ผ่านแล้ว</p>
+    </section>
+  );
 
-      {/* INTERACTIVE CANDLESTICK SIMULATOR CHART */}
-      <StrategySimulatorChart recipe={recipe} title={strategyTitle} />
-
-      {/* 4 Core Modular Sockets - Visual Selector */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Socket 1: Entry Condition */}
-        <div
-          onClick={() => setActiveStepTab(1)}
-          className={`cursor-pointer p-5 rounded-2xl transition-all border ${
-            activeStepTab === 1
-              ? 'glass-panel-glow border-cyan-400 shadow-cyan-500/20'
-              : 'glass-panel border-slate-800 hover:border-slate-700'
-          }`}
-        >
-          <div className="flex items-center justify-between mb-3">
-            <div className="w-10 h-10 rounded-xl bg-cyan-950 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
-              <Radar className="w-5 h-5" />
-            </div>
-            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-900 text-slate-400">
-              STEP 01
-            </span>
+  return (
+    <div className="builder-page">
+      <header className="builder-header">
+        <Link href="/" className="builder-logo">
+          <span>✳</span> EAxocial<span className="logo-period">.</span>
+        </Link>
+        <span className="header-divider" />
+        <span className="header-title">
+          Strategy Builder <small> / Interactive 2D Canvas</small>
+        </span>
+        <Link href="/dashboard" className="back-home">
+          ไปหน้า MT5 Terminal Dashboard →
+        </Link>
+      </header>
+      <main className={`builder-shell ${step === 0 ? "has-entry-preview" : ""}`}>
+        <div className="builder-intro">
+          <div>
+            <span className="builder-kicker">YOUR IDEAS START HERE</span>
+            <h1>มาสร้าง Strategy ของคุณกัน</h1>
+            <p>ค่อย ๆ ตั้งกติกาทีละขั้น กราฟจำลองด้านขวาจะคำนวณแท่งเทียนและปรับเส้น Indicator ตามค่าที่คุณตั้งทันที</p>
           </div>
-          <h3 className="font-bold text-white text-base">Radar Core</h3>
-          <p className="text-xs text-slate-400 mt-1">สัญญาณเข้าไม้ ({recipe.entry.setupConditions.length} เงื่อนไข)</p>
-          <div className="mt-3 text-xs font-mono text-cyan-300 bg-slate-950/70 p-2 rounded-lg border border-slate-800 truncate">
-            {recipe.entry.setupConditions.map(c => c.indicator).join(' + ')}
-          </div>
+          <button type="button" onClick={load} className="builder-text-button">
+            ↻ โหลด draft ที่บันทึก
+          </button>
         </div>
 
-        {/* Socket 2: Recovery Grid */}
-        <div
-          onClick={() => setActiveStepTab(2)}
-          className={`cursor-pointer p-5 rounded-2xl transition-all border ${
-            activeStepTab === 2
-              ? 'glass-panel-glow border-amber-400 shadow-amber-500/20'
-              : 'glass-panel border-slate-800 hover:border-slate-700'
-          }`}
-        >
-          <div className="flex items-center justify-between mb-3">
-            <div className="w-10 h-10 rounded-xl bg-amber-950 border border-amber-500/30 flex items-center justify-center text-amber-400">
-              <RotateCcw className="w-5 h-5" />
-            </div>
-            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-900 text-slate-400">
-              STEP 02
-            </span>
-          </div>
-          <h3 className="font-bold text-white text-base">Recovery Armor</h3>
-          <p className="text-xs text-slate-400 mt-1">การจัดการแก้ไม้</p>
-          <div className="mt-3 text-xs font-mono text-amber-300 bg-slate-950/70 p-2 rounded-lg border border-slate-800">
-            {recipe.recovery.mode === 'SINGLE_ORDER' ? 'ไม้เดียวจบ' : `Grid ${recipe.recovery.maxOrders} ไม้`}
-          </div>
+        <div className="preset-bar" aria-label="กลยุทธ์แนะนำพร้อมใช้งาน">
+          <span>PRESETS:</span>
+          {QUICK_STRATEGY_PRESETS.map(preset => (
+            <button
+              key={preset.id}
+              type="button"
+              className={`preset-pill ${activePresetId === preset.id ? "active" : ""}`}
+              onClick={() => {
+                setStrategy(preset.create());
+                setActivePresetId(preset.id);
+                setStep(0);
+                setNotice(`โหลดชุดกลยุทธ์ "${preset.label}" เรียบร้อยแล้ว`);
+              }}
+            >
+              {preset.label}
+            </button>
+          ))}
         </div>
 
-        {/* Socket 3: Vault Exit */}
-        <div
-          onClick={() => setActiveStepTab(3)}
-          className={`cursor-pointer p-5 rounded-2xl transition-all border ${
-            activeStepTab === 3
-              ? 'glass-panel-glow border-emerald-400 shadow-emerald-500/20'
-              : 'glass-panel border-slate-800 hover:border-slate-700'
-          }`}
-        >
-          <div className="flex items-center justify-between mb-3">
-            <div className="w-10 h-10 rounded-xl bg-emerald-950 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
-              <Target className="w-5 h-5" />
-            </div>
-            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-900 text-slate-400">
-              STEP 03
-            </span>
-          </div>
-          <h3 className="font-bold text-white text-base">Vault Exit</h3>
-          <p className="text-xs text-slate-400 mt-1">การปิดกำไร / SL</p>
-          <div className="mt-3 text-xs font-mono text-emerald-300 bg-slate-950/70 p-2 rounded-lg border border-slate-800">
-            {recipe.exit.mode === 'SWING_LOW_HIGH_RR' ? `Swing Low + RR ${recipe.exit.riskRewardRatio}x` : `RR 1:${recipe.exit.riskRewardRatio || 2}`}
-          </div>
-        </div>
-
-        {/* Socket 4: Shield & Safety */}
-        <div
-          onClick={() => setActiveStepTab(4)}
-          className={`cursor-pointer p-5 rounded-2xl transition-all border ${
-            activeStepTab === 4
-              ? 'glass-panel-glow border-rose-400 shadow-rose-500/20'
-              : 'glass-panel border-slate-800 hover:border-slate-700'
-          }`}
-        >
-          <div className="flex items-center justify-between mb-3">
-            <div className="w-10 h-10 rounded-xl bg-rose-950 border border-rose-500/30 flex items-center justify-center text-rose-400">
-              <ShieldAlert className="w-5 h-5" />
-            </div>
-            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-900 text-slate-400">
-              STEP 04
-            </span>
-          </div>
-          <h3 className="font-bold text-white text-base">Guardian Shield</h3>
-          <p className="text-xs text-slate-400 mt-1">ระบบป้องกันความเสี่ยง</p>
-          <div className="mt-3 text-xs font-mono text-rose-300 bg-slate-950/70 p-2 rounded-lg border border-slate-800">
-            Spread &lt; {recipe.shield.maxSpreadPoints} pts
-          </div>
-        </div>
-      </div>
-
-      {/* Detailed Configuration Chamber */}
-      <div className="glass-panel p-6 sm:p-8 rounded-2xl border-slate-800 space-y-6">
-        <div className="flex items-center justify-between border-b border-slate-800 pb-4">
-          <div className="flex items-center gap-2">
-            <Sliders className="w-5 h-5 text-cyan-400" />
-            <h2 className="text-lg font-bold text-white">
-              {activeStepTab === 1 && 'Step 1: กำหนดสัญญาณเข้าไม้แรก (Multi-Signal & Triggers)'}
-              {activeStepTab === 2 && 'Step 2: จัดการแก้ไม้ หรือ เทรดไม้เดียว (Recovery Armor)'}
-              {activeStepTab === 3 && 'Step 3: ปิดทำกำไร และ ตัดขาดทุน (Vault Exit & Swing SL)'}
-              {activeStepTab === 4 && 'Step 4: ระบบป้องกันและกรองสภาวะตลาด (Guardian Shield)'}
-            </h2>
-          </div>
-        </div>
-
-        {/* STEP 1: Multi-Condition Setup & Rich Trigger Modes */}
-        {activeStepTab === 1 && (
-          <div className="space-y-6">
-            {/* 1.1 Multi-Signal Conditions */}
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-300 block">
-                    1.1 เงื่อนไขสัญญาณตรวจจับ (สามารถเลือกผสมกันหลายตัวแบบ AND ได้)
-                  </label>
-                  <span className="text-[11px] text-slate-400">
-                    เข้าออเดอร์เมื่อ <strong>ทุกเงื่อนไขที่เลือกผ่านพร้อมกัน</strong> เช่น ราคาอยู่เหนือ EMA 400 และ Stochastic ตัดขึ้น
-                  </span>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => handleAddCondition('STOCHASTIC')}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyan-950 border border-cyan-500/40 text-cyan-300 text-xs font-semibold hover:bg-cyan-900/50 transition-all"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    เพิ่ม Stoch
-                  </button>
-                  <button
-                    onClick={() => handleAddCondition('EMA')}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-950 border border-amber-500/40 text-amber-300 text-xs font-semibold hover:bg-amber-900/50 transition-all"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    เพิ่ม EMA
-                  </button>
-                  <button
-                    onClick={() => handleAddCondition('RSI')}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-950 border border-purple-500/40 text-purple-300 text-xs font-semibold hover:bg-purple-900/50 transition-all"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    เพิ่ม RSI
-                  </button>
-                </div>
-              </div>
-
-              {/* Dynamic Conditions List with Inline Fine-Tuning */}
-              <div className="space-y-3">
-                {recipe.entry.setupConditions.map((cond, index) => (
-                  <div
-                    key={cond.id || index}
-                    className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-3 hover:border-slate-700 transition-all"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-mono px-2 py-0.5 rounded bg-cyan-950 text-cyan-300 font-bold border border-cyan-500/30">
-                          เงื่อนไข #{index + 1}
-                        </span>
-                        <select
-                          value={cond.indicator}
-                          onChange={(e) => handleUpdateCondition(index, { indicator: e.target.value as IndicatorType })}
-                          className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-white font-bold focus:outline-none"
-                        >
-                          <option value="EMA">EMA (Exponential Moving Average)</option>
-                          <option value="STOCHASTIC">Stochastic Oscillator</option>
-                          <option value="RSI">RSI (Relative Strength Index)</option>
-                          <option value="BOLLINGER">Bollinger Bands</option>
-                        </select>
-                      </div>
-
-                      <button
-                        onClick={() => handleRemoveCondition(index)}
-                        className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-950/50 transition-all"
-                        title="ลบเงื่อนไขนี้"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-
-                    {/* Inline Fine-Tuning depending on Indicator Type */}
-                    {cond.indicator === 'EMA' && (
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
-                        <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">Period (คาบคำนวณ)</label>
-                          <input
-                            type="number"
-                            value={cond.period}
-                            onChange={(e) => handleUpdateCondition(index, { period: Number(e.target.value) })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-amber-300 font-mono"
-                            placeholder="400"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">เงื่อนไขราคาเทียบเส้น</label>
-                          <select
-                            value={cond.operator}
-                            onChange={(e) => handleUpdateCondition(index, { operator: e.target.value as ComparisonOperator })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-cyan-400 font-mono"
-                          >
-                            <option value="ABOVE">ราคาอยู่เหนือเส้น EMA (Uptrend)</option>
-                            <option value="BELOW">ราคาอยู่ใต้เส้น EMA (Downtrend)</option>
-                            <option value="CROSS_UP">ราคาตัดเส้น EMA ขึ้น</option>
-                          </select>
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">ทิศทาง</label>
-                          <select
-                            value={cond.direction}
-                            onChange={(e) => handleUpdateCondition(index, { direction: e.target.value as 'BUY' | 'SELL' })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-emerald-400 font-mono"
-                          >
-                            <option value="BUY">BUY Order</option>
-                            <option value="SELL">SELL Order</option>
-                          </select>
-                        </div>
-                      </div>
-                    )}
-
-                    {cond.indicator === 'STOCHASTIC' && (
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
-                        <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">%K Length</label>
-                          <input
-                            type="number"
-                            value={cond.stochKPeriod || 15}
-                            onChange={(e) => handleUpdateCondition(index, { stochKPeriod: Number(e.target.value) })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-emerald-300 font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">%K Smoothing</label>
-                          <input
-                            type="number"
-                            value={cond.stochKSmoothing || 2}
-                            onChange={(e) => handleUpdateCondition(index, { stochKSmoothing: Number(e.target.value) })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-emerald-300 font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">%D Smoothing</label>
-                          <input
-                            type="number"
-                            value={cond.stochDSmoothing || 9}
-                            onChange={(e) => handleUpdateCondition(index, { stochDSmoothing: Number(e.target.value) })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-emerald-300 font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">ตรรกะตรวจจับสัญญาณ</label>
-                          <select
-                            value={cond.operator}
-                            onChange={(e) => handleUpdateCondition(index, { operator: e.target.value as ComparisonOperator })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-cyan-400 font-mono"
-                          >
-                            <option value="STOCH_K_CROSS_UP_D">%K ตัดขึ้นเหนือ %D (Step 3)</option>
-                            <option value="STOCH_K_BELOW_LEVEL">%K ต่ำกว่า 20 (Oversold - Step 2)</option>
-                            <option value="STOCH_K_CROSS_DOWN_D">%K ตัดลงใต้ %D</option>
-                          </select>
-                        </div>
-                      </div>
-                    )}
-
-                    {cond.indicator === 'RSI' && (
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
-                        <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">RSI Period</label>
-                          <input
-                            type="number"
-                            value={cond.period || 14}
-                            onChange={(e) => handleUpdateCondition(index, { period: Number(e.target.value) })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-purple-300 font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">ระดับ Threshold</label>
-                          <input
-                            type="number"
-                            value={cond.thresholdValue || 30}
-                            onChange={(e) => handleUpdateCondition(index, { thresholdValue: Number(e.target.value) })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-purple-300 font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">ตรรกะเปรียบเทียบ</label>
-                          <select
-                            value={cond.operator}
-                            onChange={(e) => handleUpdateCondition(index, { operator: e.target.value as ComparisonOperator })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-cyan-400 font-mono"
-                          >
-                            <option value="BELOW">RSI &lt; Level (Oversold)</option>
-                            <option value="ABOVE">RSI &gt; Level (Overbought)</option>
-                          </select>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* 1.2 Execution Trigger Modes (Researched from Market Best Practices) */}
-            <div className="space-y-4 pt-4 border-t border-slate-800">
-              <label className="text-xs font-semibold uppercase tracking-wider text-slate-300 block">
-                1.2 จังหวะลั่นไก (Execution Trigger Modes ในตลาดเทรดดิ้ง)
-              </label>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                {[
-                  {
-                    id: 'NEXT_BAR_OPEN',
-                    title: '1. Confirm Bar (เปิดราคาแท่งใหม่)',
-                    badge: 'ยอดนิยมสูงสุด',
-                    desc: 'รอให้แท่งเทียนปิดยืนยันสัญญาณครบถ้วน แล้วเข้าที่ราคาเปิดแท่งใหม่ ป้องกัน Repaint กลางแท่ง',
-                  },
-                  {
-                    id: 'INSTANT',
-                    title: '2. Instant Touch (เข้าทันทีแบบเรียลไทม์)',
-                    badge: 'สายสไนเปอร์',
-                    desc: 'ลั่นไกคำสั่งทันที ณ เสี้ยววินาทีที่เงื่อนไขครบ ไม่ต้องรอแท่งเทียนปิด ได้ราคาต้นทุนเร็ว',
-                  },
-                  {
-                    id: 'BREAKOUT_BAR_HIGH',
-                    title: '3. Breakout High/Low (เบรกหัวแท่งสัญญาณ)',
-                    badge: 'สายโมเมนตัม',
-                    desc: 'วาง Pending Stop เหนือ High ของแท่งสัญญาณ เข้าออเดอร์เมื่อมีแรงซื้อชนะ High เดิมเท่านั้น',
-                  },
-                  {
-                    id: 'PIN_BAR_CONFIRM',
-                    title: '4. Rejection Pin Bar (ไส้เทียนปฏิเสธราคา)',
-                    badge: 'สาย Price Action',
-                    desc: 'เข้าออเดอร์เมื่อแท่งเทียนทิ้งไส้ยาวด้านล่าง (Bullish Pin Bar) ยืนยันการปฏิเสธราคาต่ำ',
-                  },
-                  {
-                    id: 'PULLBACK_RETEST',
-                    title: '5. Pullback Retest Limit (รอย่อตัว)',
-                    badge: 'สายประหยัดต้นทุน',
-                    desc: 'เมื่อเกิดสัญญาณ จะไม่ไล่ราคา แต่รอให้ราคาย่อกลับมาทดสอบโซนเดิมเพื่อได้ระยะ Stop Loss ที่แคบลง',
-                  },
-                ].map((item) => (
-                  <div
-                    key={item.id}
-                    onClick={() => {
-                      const updated = { ...recipe };
-                      updated.entry.triggerMode = item.id as TriggerMode;
-                      setRecipe(updated);
-                    }}
-                    className={`cursor-pointer p-4 rounded-xl border transition-all ${
-                      recipe.entry.triggerMode === item.id
-                        ? 'bg-cyan-950/80 border-cyan-400 text-white shadow-lg shadow-cyan-500/20'
-                        : 'bg-slate-900/50 border-slate-800 text-slate-400 hover:border-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-1.5">
-                      <span className="font-bold text-xs text-white">{item.title}</span>
-                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-950 text-cyan-400 border border-slate-800">
-                        {item.badge}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-400 leading-relaxed">{item.desc}</p>
-                  </div>
-                ))}
-              </div>
-
-              <div className="pt-2">
-                <label className="text-xs text-slate-400 block mb-1">Initial Lot Size (ขนาดไม้แรก)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={recipe.entry.initialLotSize}
-                  onChange={(e) => {
-                    const updated = { ...recipe };
-                    updated.entry.initialLotSize = Number(e.target.value);
-                    setRecipe(updated);
+        <div className="builder-layout">
+          <div className="builder-main">
+            <nav className="builder-steps" aria-label="ขั้นตอนการสร้างกลยุทธ์">
+              {STEPS.map((name, i) => (
+                <button
+                  type="button"
+                  key={name}
+                  onClick={() => {
+                    setStep(i);
+                    setNotice("");
                   }}
-                  className="w-48 bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-cyan-400 font-mono"
-                />
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* STEP 2: Recovery Armor */}
-        {activeStepTab === 2 && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="space-y-4">
-              <label className="text-xs font-semibold uppercase tracking-wider text-slate-300 block">
-                โหมดการจัดการไม้ (Order Management)
-              </label>
-              <div className="space-y-3">
-                {[
-                  { id: 'SINGLE_ORDER', title: 'Single Order (ไม้เดียวจบ - ตามภาพกลยุทธ์)', desc: 'เข้าไม้เดียวแล้วรอปิดด้วย TP หรือ SL ไม่มีการแก้ไม้เด็ดขาด เหมาะกับกลยุทธ์ RR 1.5' },
-                  { id: 'FIXED_GRID', title: 'Fixed Distance Grid (แก้ไม้วางโซนคงที่)', desc: 'เปิดไม้เพิ่มเมื่อราคาผิดทางทุกๆ X จุด ตามระยะที่กำหนด' },
-                  { id: 'MARTINGALE', title: 'Dynamic Multiplier Grid (Martingale)', desc: 'แก้ไม้พร้อมเพิ่มขนาด Lot เพื่อดึงทุนคืนรวดเร็ว' },
-                ].map((item) => (
-                  <div
-                    key={item.id}
-                    onClick={() => {
-                      const updated = { ...recipe };
-                      updated.recovery.mode = item.id as RecoveryMode;
-                      setRecipe(updated);
-                    }}
-                    className={`cursor-pointer p-3.5 rounded-xl border transition-all ${
-                      recipe.recovery.mode === item.id
-                        ? 'bg-amber-950/70 border-amber-400 text-white shadow-md'
-                        : 'bg-slate-900/50 border-slate-800 text-slate-400 hover:border-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="font-semibold text-sm">{item.title}</span>
-                      {recipe.recovery.mode === item.id && (
-                        <CheckCircle2 className="w-4 h-4 text-amber-400" />
+                  aria-current={i === step ? "step" : undefined}
+                  className={i === step ? "active" : ""}
+                >
+                  <span>{i + 1}</span>
+                  <div>
+                    <small>STEP 0{i + 1}</small>
+                    <strong>{name}</strong>
+                  </div>
+                </button>
+              ))}
+            </nav>
+            <section className="builder-panel">
+              {step === 0 && (
+                <>
+                  <div className="panel-heading">
+                    <span className="panel-tag">STEP 01 · ENTRY</span>
+                    <h2>ตั้งสัญญาณและจังหวะเข้าไม้แรก</h2>
+                    <p>แบ่งการเข้าเป็นสองกลุ่มแยกกัน: กลุ่มแรกบอกว่ากลยุทธ์พร้อมแล้ว กลุ่มที่สองเป็นตัวกระตุ้นให้เข้าไม้แรก</p>
+                  </div>
+                  <div className="entry-stage-tabs" role="tablist" aria-label="ขั้นตอนการตั้งค่า Entry">
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={entryStage === "signal"}
+                      className={entryStage === "signal" ? "selected" : ""}
+                      onClick={() => setEntryStage("signal")}
+                    >
+                      <span>01</span>
+                      <strong>Signal Setup</strong>
+                      <small>สัญญาณ/Indicator ที่ต้องผ่าน</small>
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={entryStage === "trigger"}
+                      className={entryStage === "trigger" ? "selected" : ""}
+                      onClick={() => setEntryStage("trigger")}
+                    >
+                      <span>02</span>
+                      <strong>Entry Trigger</strong>
+                      <small>จังหวะส่งคำสั่งหลัง Setup พร้อม</small>
+                    </button>
+                  </div>
+                  <div className="entry-preview-layout">
+                    <div className="entry-config-stage">
+                      {entryStage === "signal" ? (
+                        <>
+                          {strategy.entry.firstEntryGroup && (
+                            <div className="builder-callout">
+                              มีเงื่อนไขจาก Entry รุ่นเดิมที่ใช้ ANY โปรดตรวจและย้ายเข้ากลุ่ม Setup ก่อนใช้ EA
+                              {renderEntryGroup(
+                                "firstEntryGroup",
+                                "เงื่อนไขจากรุ่นเดิม",
+                                "ข้อมูลยังเก็บไว้ครบ แก้ในกลุ่มนี้ได้",
+                                signalModuleToAdd,
+                                setSignalModuleToAdd,
+                              )}
+                            </div>
+                          )}
+                          {renderEntryGroup(
+                            "signalGroup",
+                            "สัญญาณก่อนเข้าไม้",
+                            "ใช้เป็น Setup หรือ Filter ก่อนเริ่มรอจังหวะเข้าไม้แรก",
+                            signalModuleToAdd,
+                            setSignalModuleToAdd,
+                          )}
+                          <p className="signal-explanation">
+                            รวม Indicator ด้วย ALL ให้ผ่านทุกข้อ หรือ ANY ให้ผ่านข้อใดข้อหนึ่ง · ค่าตั้งต้น EMA 400 + Stochastic 2-Step ปรับแก้ได้ทันที
+                          </p>
+                          <div className="direction-group">
+                            <span>ทิศทางที่ต้องการเทรด</span>
+                            <div>
+                              {(
+                                [
+                                  ["both", "Buy + Sell"],
+                                  ["buy", "Buy เท่านั้น"],
+                                  ["sell", "Sell เท่านั้น"],
+                                ] as const
+                              ).map(([value, label]) => (
+                                <button
+                                  key={value}
+                                  type="button"
+                                  className={strategy.direction === value ? "selected" : ""}
+                                  aria-pressed={strategy.direction === value}
+                                  onClick={() => setStrategy(s => ({ ...s, direction: value }))}
+                                >
+                                  {label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </>
+                      ) : (
+                        entryTriggerSettings(strategy.entry.trigger ?? defaultEntryTrigger(), patch =>
+                          setStrategy(s => ({
+                            ...s,
+                            entry: { ...s.entry, trigger: { ...(s.entry.trigger ?? defaultEntryTrigger()), ...patch } },
+                          })),
+                        )
                       )}
                     </div>
-                    <p className="text-xs text-slate-400 mt-1">{item.desc}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {recipe.recovery.mode !== 'SINGLE_ORDER' && (
-              <div className="space-y-4 p-5 rounded-xl bg-slate-900/80 border border-slate-800">
-                <span className="text-xs font-semibold text-amber-300 font-mono block">
-                  ⚙️ ตั้งค่าความถี่และขนาดการแก้ไม้:
-                </span>
-                <div className="space-y-3">
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">จำนวนไม้สูงสุด (Max Orders)</label>
-                    <input
-                      type="number"
-                      value={recipe.recovery.maxOrders}
-                      onChange={(e) => {
-                        const updated = { ...recipe };
-                        updated.recovery.maxOrders = Number(e.target.value);
-                        setRecipe(updated);
-                      }}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-amber-300 font-mono"
+                    <EntryPreviewChart
+                      strategy={strategy}
+                      stage={entryStage}
+                      onTimeframeChange={timeframe => setStrategy(s => ({ ...s, timeframe }))}
                     />
                   </div>
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">ระยะห่างการแก้ไม้ (Grid Distance Points)</label>
-                    <input
-                      type="number"
-                      value={recipe.recovery.gridDistancePoints}
-                      onChange={(e) => {
-                        const updated = { ...recipe };
-                        updated.recovery.gridDistancePoints = Number(e.target.value);
-                        setRecipe(updated);
-                      }}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-amber-300 font-mono"
-                    />
+                  <div className="builder-callout">
+                    ตั้งค่าและดูตัวอย่างบนกราฟได้ทันที · กดสลับสถานการณ์ตลาดด้านบนกราฟ (Pullback, Trend, Breakout, Sideway หรือ ↻ สถานการณ์ใหม่) เพื่อดูพฤติกรรมของกลยุทธ์ในหลายรูปแบบตลาด
                   </div>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
+                </>
+              )}
 
-        {/* STEP 3: Vault Exit with Swing Low / High RR */}
-        {activeStepTab === 3 && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="space-y-4">
-              <label className="text-xs font-semibold uppercase tracking-wider text-slate-300 block">
-                รูปแบบการปิดทำกำไรและตัดขาดทุน (Exit Logic)
-              </label>
-              <div className="space-y-3">
-                {[
-                  { 
-                    id: 'SWING_LOW_HIGH_RR', 
-                    title: 'Stop Loss ที่ Swing Low + TP อัตราส่วน RR 1.5 (ตามภาพกลยุทธ์)', 
-                    desc: 'หาจุดสวิงโลว์ต่ำสุดก่อนหน้าเพื่อตั้ง Stop Loss อัตโนมัติ และคำนวณจุด Take Profit ให้ได้กำไร 1.5 เท่าของความเสี่ยง' 
-                  },
-                  { 
-                    id: 'RISK_REWARD', 
-                    title: 'Risk-Reward Ratio (ระยะจุดคงที่ x RR)', 
-                    desc: 'กำหนด SL เป็นระยะจุดคงที่ เช่น 400 จุด แล้วคำนวณ TP เป็น 1.5 เท่า หรือ 2 เท่า' 
-                  },
-                  { 
-                    id: 'BASKET_DOLLAR', 
-                    title: 'Basket Dollar Target (ปิดรวบดอลลาร์)', 
-                    desc: 'ปิดรวบกำไรเป็นเงินดอลลาร์รวมเมื่อแตะเป้า เช่น +$15' 
-                  },
-                ].map((item) => (
-                  <div
-                    key={item.id}
-                    onClick={() => {
-                      const updated = { ...recipe };
-                      updated.exit.mode = item.id as ExitMode;
-                      setRecipe(updated);
-                    }}
-                    className={`cursor-pointer p-3.5 rounded-xl border transition-all ${
-                      recipe.exit.mode === item.id
-                        ? 'bg-emerald-950/70 border-emerald-400 text-white shadow-md'
-                        : 'bg-slate-900/50 border-slate-800 text-slate-400 hover:border-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="font-semibold text-sm">{item.title}</span>
-                      {recipe.exit.mode === item.id && (
-                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+              {step === 1 && hasManageOptions(strategy) && (
+                <>
+                  <div className="panel-heading">
+                    <span className="panel-tag">STEP 02 · MANAGE</span>
+                    <h2>เลือกรูปแบบการออกไม้</h2>
+                    <p>Strategy เดิมแก้ไขรูปแบบการจัดการไม้ได้ โดยยังคงค่า Entry และ Exit เดิมไว้</p>
+                  </div>
+                  <div className="manage-mode-options" role="group" aria-label="รูปแบบการจัดการไม้">
+                    <button
+                      type="button"
+                      className={manageMode(strategy) === "single" ? "selected" : ""}
+                      aria-pressed={manageMode(strategy) === "single"}
+                      onClick={() => setStrategy(s => ({ ...s, manage: { ...s.manage, mode: "single", maxPositions: 1 } }))}
+                    >
+                      <span className="mode-indicator" />
+                      <span>
+                        <strong>Simple · เข้าไม้เดียว</strong>
+                        <small>เปิดครั้งเดียวตามสัญญาณ ใช้ TP/SL ปกติ ไม่มีไม้แก้</small>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className={manageMode(strategy) === "recovery" ? "selected" : ""}
+                      aria-pressed={manageMode(strategy) === "recovery"}
+                      onClick={() =>
+                        setStrategy(s => {
+                          const saved = s.manage.recovery ?? {
+                            maxAdds: 3,
+                            spacingPoints: 0,
+                            lotMode: "fixed" as LotMode,
+                            lotMultiplier: 1,
+                            preset: "candle" as RecoveryPreset,
+                          };
+                          const recovery = saved.maxAdds > 0 ? saved : { ...saved, maxAdds: 3 };
+                          return { ...s, manage: { ...s.manage, mode: "recovery", maxPositions: recovery.maxAdds + 1, recovery } };
+                        })
+                      }
+                    >
+                      <span className="mode-indicator" />
+                      <span>
+                        <strong>Recovery · มีไม้แก้</strong>
+                        <small>เลือกชุดสำเร็จและปรับเงื่อนไขการเพิ่มไม้ได้</small>
+                      </span>
+                    </button>
+                  </div>
+                  <div className="settings-box">
+                    <div className="settings-title">
+                      ค่าที่ใช้ร่วมกัน <span>ใช้ทั้ง Simple และ Recovery</span>
+                    </div>
+                    <div className="field-grid">
+                      {field("Lot เริ่มต้น", strategy.manage.lotSize, n => setStrategy(s => ({ ...s, manage: { ...s.manage, lotSize: n } })), "lot", 0.01, 0.01)}
+                    </div>
+                    <p className="signal-explanation">Lot เริ่มต้นใช้กับไม้แรก · ขนาด lot ที่ใช้ได้จริงขึ้นอยู่กับข้อกำหนดของโบรกเกอร์และสินทรัพย์</p>
+                    {manageMode(strategy) === "single" ? (
+                      <div className="mode-detail-note">Simple เปิดได้ครั้งละ 1 ไม้ ไม่เพิ่มไม้แก้ · ตั้ง TP/SL ของไม้ได้ในขั้น Exit</div>
+                    ) : (
+                      <>
+                        <div className="recovery-preset-heading">
+                          <div>
+                            <strong>เลือกชุด Recovery</strong>
+                            <small>คลิกชุดที่ต้องการ แล้วปรับรายละเอียดด้านล่างได้</small>
+                          </div>
+                          <span>6 ชุด</span>
+                        </div>
+                        <div className="recovery-preset-grid" role="group" aria-label="ชุดจัดการไม้แก้">
+                          {recoveryPresets.map((preset, index) => (
+                            <button
+                              key={preset.id}
+                              type="button"
+                              className={`recovery-preset-card ${recoveryPreset(strategy) === preset.id ? "selected" : ""}`}
+                              aria-pressed={recoveryPreset(strategy) === preset.id}
+                              onClick={() => selectRecoveryPreset(preset.id)}
+                            >
+                              <span className="preset-number">0{index + 1}</span>
+                              <span className="preset-radio" />
+                              <strong>{preset.title}</strong>
+                              <small>{preset.description}</small>
+                            </button>
+                          ))}
+                        </div>
+                        <button
+                          type="button"
+                          className={`custom-recovery-button ${recoveryPreset(strategy) === "custom" ? "selected" : ""}`}
+                          aria-pressed={recoveryPreset(strategy) === "custom"}
+                          onClick={() => selectRecoveryPreset("custom")}
+                        >
+                          <span>＋</span>
+                          <span>
+                            <strong>สร้างชุดเอง</strong>
+                            <small>เริ่มจากเงื่อนไขพื้นฐาน แล้วเพิ่มหรือแก้กติกาของไม้แก้แต่ละลำดับ</small>
+                          </span>
+                        </button>
+                        {(() => {
+                          const presetId = recoveryPreset(strategy);
+                          const preset = recoveryPresets.find(item => item.id === presetId);
+                          const recovery = strategy.manage.recovery!;
+                          const presetTitle = preset?.title ?? "ชุดที่สร้างเอง";
+                          const presetSignal = preset?.signal ?? "CUSTOM ENTRY RULES";
+                          const presetDetails =
+                            preset?.details ?? "ปรับเงื่อนไขของไม้แก้แต่ละลำดับได้อย่างอิสระ และบันทึกเป็น Strategy ส่วนตัวหรือแชร์ใน Explore";
+                          return (
+                            <div className="preset-details">
+                              <div className="preset-details-heading">
+                                <span className="panel-tag">SELECTED · {presetSignal.toUpperCase()}</span>
+                                <h3>{presetTitle}</h3>
+                                <p>{presetDetails}</p>
+                              </div>
+                              <div className="field-grid recovery-fields">
+                                <label className="builder-field">
+                                  <span>จำนวนไม้แก้สูงสุด</span>
+                                  <span className="input-wrap">
+                                    <select value={recovery.maxAdds} onChange={e => updateRecovery({ maxAdds: num(e.target.value) })}>
+                                      <option value={1}>1 ไม้เพิ่ม</option>
+                                      <option value={2}>2 ไม้เพิ่ม</option>
+                                      <option value={3}>3 ไม้เพิ่ม</option>
+                                    </select>
+                                  </span>
+                                </label>
+                                <label className="builder-field">
+                                  <span>วิธีคำนวณระยะ</span>
+                                  <span className="input-wrap">
+                                    <select
+                                      value={recovery.spacingMode ?? "fixed"}
+                                      onChange={e => updateRecovery({ spacingMode: e.target.value as "fixed" | "atr" })}
+                                    >
+                                      <option value="fixed">ระยะคงที่</option>
+                                      <option value="atr">อิง ATR</option>
+                                    </select>
+                                  </span>
+                                </label>
+                                {recovery.spacingMode !== "atr" &&
+                                  field("ระยะสวนทางก่อนเพิ่ม", recovery.spacingPoints, n => updateRecovery({ spacingPoints: n }), "points", 0, 1)}
+                              </div>
+                              {recovery.spacingMode === "atr" && (
+                                <div className="field-grid recovery-fields">
+                                  {field("ATR period", recovery.atrPeriod ?? 14, n => updateRecovery({ atrPeriod: n }), "แท่ง", 1)}
+                                  {field("ตัวคูณ ATR", recovery.atrMultiplier ?? 1, n => updateRecovery({ atrMultiplier: n }), "×", 0.1, 0.1)}
+                                </div>
+                              )}
+                              {presetId === "atr" && (
+                                <label className="preset-check">
+                                  <input
+                                    type="checkbox"
+                                    checked={recovery.pauseOnAtrExpansion ?? true}
+                                    onChange={e => updateRecovery({ pauseOnAtrExpansion: e.target.checked })}
+                                  />
+                                  <span>
+                                    <strong>พักการเพิ่มไม้เมื่อ ATR ขยายเร็ว</strong>
+                                    <small>ตัวเลือกนี้เป็นตัวกรองความผันผวน ไม่ได้ทำนายทิศทางราคา</small>
+                                  </span>
+                                </label>
+                              )}
+                              {presetId === "manual" && (
+                                <div className="field-grid recovery-fields">
+                                  {field("ยกเลิกคำขอหลัง", recovery.maxWaitBars ?? 3, n => updateRecovery({ maxWaitBars: n }), "แท่ง", 1)}
+                                </div>
+                              )}
+                              <div className="field-grid recovery-fields">
+                                {field("Cooldown ระหว่างไม้แก้", recovery.cooldownBars ?? 1, n => updateRecovery({ cooldownBars: n }), "แท่ง", 1)}
+                              </div>
+                              <details className="advanced-settings">
+                                <summary>ปรับแต่งขั้นสูง · รูปแบบ Lot</summary>
+                                <div className="field-grid">
+                                  <label className="builder-field">
+                                    <span>ขนาด Lot ของไม้แก้</span>
+                                    <span className="input-wrap">
+                                      <select value={recovery.lotMode} onChange={e => updateRecovery({ lotMode: e.target.value as LotMode })}>
+                                        <option value="fixed">เท่ากับ Lot เริ่มต้น</option>
+                                        <option value="multiplier">คูณจากไม้ก่อนหน้า</option>
+                                      </select>
+                                    </span>
+                                  </label>
+                                  {recovery.lotMode === "multiplier" &&
+                                    field("ตัวคูณ Lot", recovery.lotMultiplier, n => updateRecovery({ lotMultiplier: n }), "×", 1, 0.1)}
+                                </div>
+                              </details>
+                              <div className="order-rules-heading">
+                                <div>
+                                  <strong>เงื่อนไขเข้าไม้แก้แต่ละลำดับ</strong>
+                                  <small>แต่ละไม้มีเงื่อนไขแยกกัน และเลือกเพิ่มหลายข้อได้</small>
+                                </div>
+                              </div>
+                              <div className="add-order-rules">
+                                {Array.from({ length: recovery.maxAdds }, (_, orderIndex) => {
+                                  const rule = recovery.orderRules?.[orderIndex] ?? {
+                                    logic: "all" as const,
+                                    conditions: [],
+                                    trigger: defaultEntryTrigger(),
+                                  };
+                                  return (
+                                    <details className="add-order-rule" key={orderIndex} open={orderIndex === 0}>
+                                      <summary>
+                                        <span>ไม้แก้ {orderIndex + 1}</span>
+                                        <small>
+                                          {rule.conditions.length === 0
+                                            ? "ใช้ระยะและ Safety Gate"
+                                            : `${rule.conditions.length} เงื่อนไข · ${
+                                                rule.logic === "all" ? "ต้องผ่านทั้งหมด" : "ผ่านข้อใดข้อหนึ่ง"
+                                              }`}
+                                        </small>
+                                      </summary>
+                                      <div className="order-rule-body">
+                                        <div className="phase-label">จังหวะ 1 · รอสัญญาณพร้อมสำหรับไม้แก้</div>
+                                        <div className="field-grid">
+                                          <label className="builder-field">
+                                            <span>การรวมเงื่อนไขเสริม</span>
+                                            <span className="input-wrap">
+                                              <select
+                                                value={rule.logic}
+                                                onChange={e => updateOrderRule(orderIndex, { logic: e.target.value as "all" | "any" })}
+                                              >
+                                                <option value="all">ALL · ต้องผ่านทุกข้อ</option>
+                                                <option value="any">ANY · ผ่านข้อใดก็ได้</option>
+                                              </select>
+                                            </span>
+                                          </label>
+                                          <div className="order-rule-required">
+                                            <strong>เงื่อนไขบังคับ</strong>
+                                            <small>ระยะสวนทาง + Safety Gate</small>
+                                          </div>
+                                        </div>
+                                        {rule.conditions.map((condition, conditionIndex) => (
+                                          <div className="recovery-condition" key={`${orderIndex}-${conditionIndex}`}>
+                                            <div className="condition-row-heading">
+                                              <strong>Condition {conditionIndex + 1}</strong>
+                                              <button
+                                                type="button"
+                                                className="remove-condition"
+                                                onClick={() => removeOrderCondition(orderIndex, conditionIndex)}
+                                              >
+                                                ลบ
+                                              </button>
+                                            </div>
+                                            <div className="field-grid">
+                                              <label className="builder-field">
+                                                <span>เงื่อนไข</span>
+                                                <span className="input-wrap">
+                                                  <select
+                                                    value={condition.kind}
+                                                    onChange={e =>
+                                                      updateOrderCondition(
+                                                        orderIndex,
+                                                        conditionIndex,
+                                                        newCondition(e.target.value as RecoveryConditionKind),
+                                                      )
+                                                    }
+                                                  >
+                                                    {Object.entries(conditionLabels).map(([kind, label]) => (
+                                                      <option key={kind} value={kind}>
+                                                        {label}
+                                                      </option>
+                                                    ))}
+                                                  </select>
+                                                </span>
+                                              </label>
+                                              {(condition.kind === "candle_reversal" ||
+                                                condition.kind === "trend_filter" ||
+                                                condition.kind === "range_reentry") && (
+                                                <label className="builder-field">
+                                                  <span>Timeframe</span>
+                                                  <span className="input-wrap">
+                                                    <select
+                                                      value={condition.timeframe ?? "same"}
+                                                      onChange={e =>
+                                                        updateOrderCondition(orderIndex, conditionIndex, { ...condition, timeframe: e.target.value })
+                                                      }
+                                                    >
+                                                      <option value="same">ใช้ timeframe ของ Strategy</option>
+                                                      <option value="M15">M15</option>
+                                                      <option value="H1">H1</option>
+                                                      <option value="H4">H4</option>
+                                                    </select>
+                                                  </span>
+                                                </label>
+                                              )}
+                                            </div>
+                                          </div>
+                                        ))}
+                                        <button type="button" className="add-condition-button" onClick={() => addOrderCondition(orderIndex)}>
+                                          ＋ เพิ่ม Condition ให้ไม้แก้ {orderIndex + 1}
+                                        </button>
+                                        <div className="order-trigger-stage">
+                                          <div className="phase-label">จังหวะ 2 · เมื่อพร้อมแล้วจะเข้าไม้แก้เมื่อใด</div>
+                                          {triggerSettings(rule.trigger ?? defaultEntryTrigger(), patch => updateOrderTrigger(orderIndex, patch))}
+                                        </div>
+                                      </div>
+                                    </details>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })()}
+                      </>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {step === 2 && usesBasketExit(strategy) && (
+                <>
+                  <div className="panel-heading">
+                    <span className="panel-tag">STEP 03 · EXIT</span>
+                    <h2>เลือกวิธีปิดหรือคลายชุด</h2>
+                    <p>ตั้งขีดจำกัด Basket TP/SL แล้วเพิ่มวิธีจัดการอื่นได้หลายข้อ · เงื่อนไขปิดเต็มชุดที่เกิดก่อนจะเป็นตัวปิดชุด</p>
+                  </div>
+                  <div className="settings-box">
+                    <div className="settings-title">
+                      ขีดจำกัดหลักของทั้งชุด <span>ใช้กับไม้แก้ทุกลำดับ</span>
+                    </div>
+                    <div className="field-grid">
+                      {field(
+                        "ปิดทั้งชุดเมื่อกำไรถึง",
+                        strategy.exit.basketTakeProfit ?? 0,
+                        n => setStrategy(s => ({ ...s, exit: { ...s.exit, basketTakeProfit: n } })),
+                        "เงิน",
+                        0,
+                        0.01,
+                      )}
+                      {field(
+                        "ปิดทั้งชุดเมื่อขาดทุนถึง",
+                        strategy.exit.basketStopLoss ?? 0,
+                        n => setStrategy(s => ({ ...s, exit: { ...s.exit, basketStopLoss: n } })),
+                        "เงิน",
+                        0,
+                        0.01,
                       )}
                     </div>
-                    <p className="text-xs text-slate-400 mt-1">{item.desc}</p>
                   </div>
-                ))}
-              </div>
-            </div>
+                  <div className="exit-rules-panel">
+                    <div className="order-rules-heading">
+                      <div>
+                        <strong>วิธีปิดเพิ่มเติม</strong>
+                        <small>เพิ่มได้หลายข้อ · เงื่อนไขปิดเต็มชุดใช้แบบข้อใดเกิดก่อน</small>
+                      </div>
+                    </div>
+                    {(strategy.exit.closeRules ?? []).map((rule, index) => (
+                      <div className="exit-rule-card" key={`exit-${index}`}>
+                        <div className="condition-row-heading">
+                          <strong>Exit Rule {index + 1}</strong>
+                          <button type="button" className="remove-condition" onClick={() => removeExitRule(index)}>
+                            ลบ
+                          </button>
+                        </div>
+                        <label className="builder-field">
+                          <span>วิธีจัดการ</span>
+                          <span className="input-wrap">
+                            <select
+                              value={rule.kind}
+                              onChange={e => updateExitRule(index, { kind: e.target.value as ExitRuleKind, value: 0, secondaryValue: 0 })}
+                            >
+                              {Object.entries(exitRuleLabels).map(([kind, label]) => (
+                                <option key={kind} value={kind}>
+                                  {label}
+                                </option>
+                              ))}
+                            </select>
+                          </span>
+                        </label>
+                      </div>
+                    ))}
+                    <button type="button" className="add-condition-button" onClick={addExitRule}>
+                      ＋ เพิ่มวิธีปิดหรือจัดการชุด
+                    </button>
+                  </div>
+                </>
+              )}
 
-            <div className="space-y-4 p-5 rounded-xl bg-slate-900/80 border border-slate-800">
-              <span className="text-xs font-semibold text-emerald-300 font-mono block">
-                🎯 พารามิเตอร์อัตราส่วนกำไร / ขาดทุน:
-              </span>
-              <div className="space-y-3">
-                <div>
-                  <label className="text-xs text-slate-400 block mb-1">
-                    Risk/Reward Ratio (เช่น 1.5 หรือ 2.0)
-                  </label>
-                  <input
-                    type="number"
-                    step="0.1"
-                    value={recipe.exit.riskRewardRatio || 1.5}
-                    onChange={(e) => {
-                      const updated = { ...recipe };
-                      updated.exit.riskRewardRatio = Number(e.target.value);
-                      setRecipe(updated);
+              {step === 2 && !usesBasketExit(strategy) && (
+                <>
+                  <div className="panel-heading">
+                    <span className="panel-tag">STEP 03 · EXIT</span>
+                    <h2>ตั้ง TP และ SL ของไม้เดียว</h2>
+                    <p>Buy วาง SL ใต้ราคา (Swing Low ก่อนหน้า) · Sell วาง SL เหนือราคา (Swing High ก่อนหน้า)</p>
+                  </div>
+                  <div className="settings-box">
+                    <div className="field-grid">
+                      <label className="builder-field">
+                        <span>วิธีวาง Stop Loss</span>
+                        <span className="input-wrap">
+                          <select
+                            value={strategy.exit.stopMode ?? "fixed_pips"}
+                            onChange={e => setStrategy(s => ({ ...s, exit: { ...s.exit, stopMode: e.target.value as "fixed_pips" | "swing" } }))}
+                          >
+                            <option value="swing">Swing High/Low ก่อนหน้า + TP ตาม RR</option>
+                            <option value="fixed_pips">SL / TP ระยะคงที่</option>
+                          </select>
+                        </span>
+                      </label>
+                      {strategy.exit.stopMode === "swing" ? (
+                        <>
+                          {field(
+                            "Lookback หา Swing",
+                            strategy.exit.swingLookbackBars ?? 10,
+                            n => setStrategy(s => ({ ...s, exit: { ...s.exit, swingLookbackBars: n } })),
+                            "แท่งปิด",
+                            1,
+                          )}
+                          {field(
+                            "Buffer จาก Swing",
+                            strategy.exit.swingBufferPoints ?? 0,
+                            n => setStrategy(s => ({ ...s, exit: { ...s.exit, swingBufferPoints: n } })),
+                            "points",
+                            0,
+                            0.1,
+                          )}
+                          {field(
+                            "Risk : Reward",
+                            strategy.exit.riskRewardRatio ?? 1.5,
+                            n => setStrategy(s => ({ ...s, exit: { ...s.exit, riskRewardRatio: n } })),
+                            "R",
+                            0.1,
+                            0.1,
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          {field(
+                            "Stop Loss",
+                            strategy.exit.stopLossPips,
+                            n => setStrategy(s => ({ ...s, exit: { ...s.exit, stopLossPips: n } })),
+                            "pips",
+                          )}
+                          {field(
+                            "Take Profit",
+                            strategy.exit.takeProfitPips,
+                            n => setStrategy(s => ({ ...s, exit: { ...s.exit, takeProfitPips: n } })),
+                            "pips",
+                          )}
+                        </>
+                      )}
+                    </div>
+                    <p className="signal-explanation">
+                      Swing ใช้แท่งปิดก่อนสัญญาณพร้อม: Buy หา Low ต่ำสุด · Sell หา High สูงสุด · TP = ระยะ Entry ถึง SL × RR
+                    </p>
+                  </div>
+                </>
+              )}
+
+              {step === 3 && (
+                <>
+                  <div className="panel-heading">
+                    <span className="panel-tag">STEP 04 · PROTECTION</span>
+                    <h2>ตั้งขอบเขตก่อนเริ่ม</h2>
+                    <p>จำกัด spread สูงสุดที่ยอมรับได้ก่อนเปิดไม้ใหม่</p>
+                  </div>
+                  <div className="settings-box">
+                    <div className="field-grid">
+                      {field(
+                        "Spread สูงสุด",
+                        strategy.protection.maxSpreadPoints,
+                        n => setStrategy(s => ({ ...s, protection: { ...s.protection, maxSpreadPoints: n } })),
+                        "points",
+                      )}
+                    </div>
+                    <p className="signal-explanation">เมื่อ spread เกินค่านี้ กติกาที่ตั้งไว้จะไม่เปิดไม้ใหม่ · points เป็นหน่วยของโบรกเกอร์</p>
+                  </div>
+                </>
+              )}
+
+              <div className="panel-actions">
+                <button
+                  type="button"
+                  className="button-back"
+                  onClick={() => {
+                    setStep(Math.max(0, step - 1));
+                    setNotice("");
+                  }}
+                  disabled={step === 0}
+                >
+                  ← ย้อนกลับ
+                </button>
+                {step < 3 ? (
+                  <button
+                    type="button"
+                    className="button-next"
+                    onClick={() => {
+                      setStep(step + 1);
+                      setNotice("");
                     }}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-emerald-300 font-mono"
-                  />
-                  <p className="text-[11px] text-slate-500 mt-1">
-                    หาก Stop Loss ห่าง 10 จุด ➔ TP จะตั้งที่ระยะ 15 จุด (RR 1.5 เท่า)
-                  </p>
-                </div>
-
-                {recipe.exit.mode === 'SWING_LOW_HIGH_RR' && (
-                  <div>
-                    <label className="text-xs text-slate-400 block mb-1">
-                      ย้อนหลังหา Swing Low (จำนวนแท่งเทียน Lookback)
-                    </label>
-                    <input
-                      type="number"
-                      value={recipe.exit.swingLookbackBars || 10}
-                      onChange={(e) => {
-                        const updated = { ...recipe };
-                        updated.exit.swingLookbackBars = Number(e.target.value);
-                        setRecipe(updated);
-                      }}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-cyan-400 font-mono"
-                    />
-                  </div>
+                  >
+                    ขั้นตอนถัดไป <span>→</span>
+                  </button>
+                ) : (
+                  <button type="button" className="button-next" onClick={save}>
+                    บันทึก Draft <span>✓</span>
+                  </button>
                 )}
               </div>
-            </div>
+              {notice && (
+                <p className="builder-notice" role="status">
+                  {notice}
+                </p>
+              )}
+            </section>
           </div>
-        )}
 
-        {/* STEP 4: Shield & Safety */}
-        {activeStepTab === 4 && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="space-y-4">
-              <label className="text-xs font-semibold uppercase tracking-wider text-slate-300 block">
-                เกราะป้องกันสเปรดและขาดทุนสะสม (Hard Limits)
-              </label>
-              <div className="space-y-3">
-                <div>
-                  <label className="text-xs text-slate-400 block mb-1">Max Spread (Points)</label>
-                  <input
-                    type="number"
-                    value={recipe.shield.maxSpreadPoints}
-                    onChange={(e) => {
-                      const updated = { ...recipe };
-                      updated.shield.maxSpreadPoints = Number(e.target.value);
-                      setRecipe(updated);
-                    }}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-rose-300 font-mono"
-                  />
-                </div>
-
-                <div>
-                  <label className="text-xs text-slate-400 block mb-1">Daily Max Loss Cut (%)</label>
-                  <input
-                    type="number"
-                    step="0.5"
-                    value={recipe.shield.maxDailyLossPercent}
-                    onChange={(e) => {
-                      const updated = { ...recipe };
-                      updated.shield.maxDailyLossPercent = Number(e.target.value);
-                      setRecipe(updated);
-                    }}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-rose-300 font-mono"
-                  />
-                </div>
-              </div>
+          <aside className="builder-sidebar">
+            <div className="sidebar-top">
+              <span>YOUR STRATEGY</span>
+              <span className="draft-badge">● INTERACTIVE 2D</span>
             </div>
-
-            <div className="space-y-4 p-5 rounded-xl bg-slate-900/80 border border-slate-800">
-              <span className="text-xs font-semibold text-rose-300 font-mono block">
-                🛡️ ตัวกรองข่าวและช่วงเวลาเทรด:
-              </span>
-              <div className="flex items-center justify-between p-3 rounded-lg bg-slate-950 border border-slate-800">
-                <div>
-                  <span className="text-sm font-semibold text-white block">High-Impact News Filter</span>
-                  <span className="text-xs text-slate-400">หยุดเทรดก่อน-หลังข่าวแดง 30 นาที</span>
-                </div>
+            <label className="sidebar-name">
+              ชื่อ Strategy
+              <input value={strategy.name} maxLength={80} onChange={e => setStrategy(s => ({ ...s, name: e.target.value }))} />
+            </label>
+            <div className="sidebar-fields">
+              <label>
+                สัญลักษณ์
                 <input
-                  type="checkbox"
-                  checked={recipe.shield.newsFilterEnabled}
-                  onChange={(e) => {
-                    const updated = { ...recipe };
-                    updated.shield.newsFilterEnabled = e.target.checked;
-                    setRecipe(updated);
-                  }}
-                  className="w-5 h-5 accent-rose-500 rounded cursor-pointer"
+                  value={strategy.symbol}
+                  maxLength={20}
+                  onChange={e => setStrategy(s => ({ ...s, symbol: e.target.value.toUpperCase() }))}
                 />
-              </div>
+              </label>
+              <label>
+                Timeframe
+                <select value={strategy.timeframe} onChange={e => setStrategy(s => ({ ...s, timeframe: e.target.value }))}>
+                  <option>M1</option>
+                  <option>M5</option>
+                  <option>M15</option>
+                  <option>H1</option>
+                  <option>H4</option>
+                  <option>D1</option>
+                </select>
+              </label>
             </div>
-          </div>
-        )}
-
-        {/* Action Dispatcher Bar */}
-        <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-4 border-t border-slate-800">
-          <div className="text-xs text-slate-400 font-mono">
-            Active: <span className="text-cyan-400">{recipe.entry.setupConditions.length} Conditions Linked</span>
-          </div>
-          <div className="flex items-center gap-3 w-full sm:w-auto">
-            <button
-              onClick={() => alert('Strategy Recipe Copied! Ready to share on social feed.')}
-              className="flex-1 sm:flex-initial flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition-all"
-            >
-              <Share2 className="w-4 h-4" />
-              แชร์การ์ดลงโซเชียล
-            </button>
-            <button
-              onClick={handlePushToMt5}
-              className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 text-slate-950 text-xs font-bold uppercase tracking-wider hover:opacity-90 shadow-lg shadow-cyan-500/25 transition-all"
-            >
-              <Send className="w-4 h-4" />
-              Sync Recipe to MT5
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* AI Video Extraction Modal */}
-      {isAiModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md p-4 animate-fade-in">
-          <div className="w-full max-w-lg glass-panel-glow p-6 rounded-2xl border-purple-500/30 space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Video className="w-5 h-5 text-pink-400" />
-                <h3 className="text-lg font-bold text-white">ถอดกลยุทธ์จาก YouTube / TikTok</h3>
-              </div>
-              <button onClick={() => setIsAiModalOpen(false)} className="text-slate-400 hover:text-white">✕</button>
-            </div>
-            <p className="text-xs text-slate-400 leading-relaxed">
-              วางลิงก์คลิป หรือพิมพ์ข้อความสรุปเทคนิคเทรด AI จะทำการถอดโครงสร้างออกมาประกอบเป็น 4 โมดูลของ EAxocial ให้อัตโนมัติ
-            </p>
-            <input
-              type="text"
-              placeholder="วางลิงก์ https://youtube.com/watch?v=... หรือ TikTok"
-              value={videoUrl}
-              onChange={(e) => setVideoUrl(e.target.value)}
-              className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-purple-400"
+            <RuntimeExport
+              strategy={strategy}
+              strategyId={strategyId}
+              isPublic={isPublic}
+              savedFingerprint={savedFingerprint}
+              savedPublic={savedPublic}
+              onSyncMt5={handleSyncToMt5}
+              syncBusy={syncBusy}
             />
-            {aiSuccessMsg && (
-              <div className="p-3 rounded-xl bg-purple-950/60 border border-purple-500/40 text-purple-200 text-xs flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-pink-400 shrink-0" />
-                <span>{aiSuccessMsg}</span>
+            <div className="summary-list">
+              <div>
+                <span>
+                  01 <b>Entry</b>
+                </span>
+                <strong>{summary}</strong>
               </div>
-            )}
-            <div className="flex items-center justify-end gap-3 pt-2">
-              <button onClick={() => setIsAiModalOpen(false)} className="px-4 py-2 rounded-xl text-xs text-slate-400 hover:text-white">ยกเลิก</button>
-              <button
-                onClick={() => {
-                  handleLoadPreset('strat-stoch-ema400');
-                  setAiSuccessMsg('ถอดกลยุทธ์จากคลิปสำเร็จ: บรรจุ Apex 400 Stoch Sniper (RR 1.5) พร้อมกราฟจำลองเรียบร้อย!');
-                }}
-                className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-purple-500 to-pink-500 text-white font-bold text-xs uppercase tracking-wider hover:opacity-90 shadow-md shadow-purple-500/30"
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                เริ่มถอดกลยุทธ์
-              </button>
+              <div>
+                <span>
+                  02 <b>Manage</b>
+                </span>
+                <strong>
+                  {hasManageOptions(strategy)
+                    ? manageMode(strategy) === "single"
+                      ? `${strategy.manage.lotSize} lot · Simple · 1 ไม้`
+                      : `${strategy.manage.lotSize} lot · ${
+                          recoveryPreset(strategy) === "custom"
+                            ? "ชุด Custom"
+                            : recoveryPresets.find(p => p.id === recoveryPreset(strategy))?.title ?? "Recovery"
+                        } · แก้ ${strategy.manage.recovery?.maxAdds ?? 0} ไม้`
+                    : `${strategy.manage.lotSize} lot · สูงสุด ${strategy.manage.maxPositions} ไม้`}
+                </strong>
+              </div>
+              <div>
+                <span>
+                  03 <b>Exit</b>
+                </span>
+                <strong>{exitSummary}</strong>
+              </div>
+              <div>
+                <span>
+                  04 <b>Protection</b>
+                </span>
+                <strong>Spread ไม่เกิน {strategy.protection.maxSpreadPoints} points</strong>
+              </div>
             </div>
-          </div>
+            <label className="publish-toggle">
+              <input
+                type="checkbox"
+                checked={isPublic}
+                onChange={e => {
+                  if (e.target.checked) {
+                    const error = valid(strategy);
+                    if (error) {
+                      setNotice(error);
+                      return;
+                    }
+                  }
+                  setIsPublic(e.target.checked);
+                }}
+              />
+              <span>
+                <strong>แชร์ใน Social Feed / Explore</strong>
+                <small>{valid(strategy) ? "กรอกเงื่อนไข Manage และ TP/SL ให้ครบก่อนแชร์" : "ทุกคนจะเห็นกติกานี้และคัดลอกไปรันใน MT5 ได้"}</small>
+              </span>
+            </label>
+            <button type="button" className="account-save" disabled={remoteBusy} onClick={saveRemote}>
+              {remoteBusy ? "กำลังบันทึก…" : strategyId ? "บันทึกการแก้ไขในบัญชี" : "บันทึก Draft ลงบัญชี"}
+            </button>
+            <div className="sidebar-account-links">
+              <Link href="/dashboard">MT5 Terminal →</Link>
+              <Link href="/feed">Social Feed →</Link>
+            </div>
+            <div className="sidebar-foot">
+              <span>✳</span>
+              <p>
+                บันทึก Draft และปรับค่าได้ทันที · กราฟจำลองคำนวณจาก Indicator จริงทุกครั้งที่เปลี่ยนตัวเลข
+                {loaded ? " · โหลด Draft กลับมาแก้ไขได้" : ""}
+              </p>
+            </div>
+          </aside>
         </div>
-      )}
+        <p className="builder-footer">EAxocial · สร้างอย่างเข้าใจ ทดลองอย่างรอบคอบ</p>
+      </main>
     </div>
   );
 }
