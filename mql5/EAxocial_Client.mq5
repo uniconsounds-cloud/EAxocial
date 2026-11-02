@@ -33,7 +33,8 @@ const string   CLIENT_VERSION      = "1.0.0";
 string         g_currentServerVer  = "1.0.0";
 bool           g_isVersionMatch    = true;
 bool           g_isServerConnected = false;
-string         g_tradingState      = "idle"; // idle, in_position, recovering, tp_hit, shield_cut
+bool           g_isTradingEnabled  = true;
+string         g_tradingState      = "idle"; // idle, in_position, recovering, tp_hit, shield_cut, paused
 string         g_strategyTitle     = "Apex 400 Stoch Sniper (RR 1.5)";
 datetime       g_lastSyncTime      = 0;
 
@@ -111,6 +112,14 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // 0. Web Control: Check if trading is paused from web platform
+   if(!g_isTradingEnabled)
+   {
+      g_tradingState = "paused";
+      UpdateChartHUD();
+      return;
+   }
+
    // 1. Safety Checks (Spread & Balance)
    double spread = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    if(spread > InpMaxSpreadPoints)
@@ -277,7 +286,12 @@ void CloseAllPositions()
 //+------------------------------------------------------------------+
 void SyncWithServer()
 {
-   string url = InpServerBaseUrl + "/api/v1/ea/sync?token=" + InpTerminalToken + "&version=" + CLIENT_VERSION;
+   long login = AccountInfoInteger(ACCOUNT_LOGIN);
+   string company = AccountInfoString(ACCOUNT_COMPANY);
+   string url = InpServerBaseUrl + "/api/v1/ea/sync?token=" + InpTerminalToken + 
+                "&version=" + CLIENT_VERSION + 
+                "&account=" + IntegerToString(login) + 
+                "&broker=" + company;
    string headers = "User-Agent: EAxocial-MT5-Client/" + CLIENT_VERSION + "\r\n";
    char postData[], resultData[];
    string resultHeaders;
@@ -296,6 +310,12 @@ void SyncWithServer()
          g_isVersionMatch = true;
       else if(StringFind(jsonResponse, "\"version_match\":false") >= 0)
          g_isVersionMatch = false;
+
+      // Check for web trading pause/resume control
+      if(StringFind(jsonResponse, "\"trading_enabled\":false") >= 0)
+         g_isTradingEnabled = false;
+      else if(StringFind(jsonResponse, "\"trading_enabled\":true") >= 0)
+         g_isTradingEnabled = true;
    }
    else
    {
@@ -323,8 +343,9 @@ void SendHeartbeat()
    }
 
    string payload = StringFormat(
-      "{\"terminal_token\":\"%s\",\"ea_version\":\"%s\",\"trading_state\":\"%s\",\"active_orders_count\":%d,\"total_balance\":%.2f,\"total_equity\":%.2f,\"current_symbol\":\"%s\",\"current_timeframe\":\"%s\"}",
-      InpTerminalToken, CLIENT_VERSION, g_tradingState, activeCount,
+      "{\"terminal_token\":\"%s\",\"account_number\":%d,\"broker_name\":\"%s\",\"ea_version\":\"%s\",\"trading_state\":\"%s\",\"active_orders_count\":%d,\"total_balance\":%.2f,\"total_equity\":%.2f,\"current_symbol\":\"%s\",\"current_timeframe\":\"%s\"}",
+      InpTerminalToken, AccountInfoInteger(ACCOUNT_LOGIN), AccountInfoString(ACCOUNT_COMPANY),
+      CLIENT_VERSION, g_tradingState, activeCount,
       AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY),
       _Symbol, EnumToString(_Period)
    );
