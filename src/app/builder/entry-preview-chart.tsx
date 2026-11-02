@@ -11,7 +11,7 @@ const W = 760,
   TOP = 26,
   BOTTOM = 272,
   COUNT = 64;
-const colors = ["#b3a0ff", "#62dfc9", "#f6bd72", "#f48aad"];
+const colors = ["#06b6d4", "#10b981", "#f59e0b", "#a855f7"];
 
 const SCENARIO_PRESETS = [
   { id: 0, label: "Pullback ย่อตัว" },
@@ -231,7 +231,7 @@ export default function EntryPreviewChart({
             role="img"
             aria-label="กราฟแท่งเทียนจำลอง พร้อมสัญญาณ Trigger จุดเข้าและจุดออกที่ผ่านกติกา"
           >
-            <rect width={W} height={height} rx="12" fill="#121b31" />
+            <rect width={W} height={height} rx="12" fill="#090d16" />
             {[0, 1, 2, 3, 4].map((i) => (
               <g key={i}>
                 <line
@@ -241,7 +241,7 @@ export default function EntryPreviewChart({
                   y2={TOP + ((BOTTOM - TOP) * i) / 4}
                   stroke="#ffffff0e"
                 />
-                <text x="5" y={TOP + ((BOTTOM - TOP) * i) / 4 + 3} fill="#8493b4" fontSize="8">
+                <text x="5" y={TOP + ((BOTTOM - TOP) * i) / 4 + 3} fill="#64748b" fontSize="8">
                   {(high + padding - ((high - low + padding * 2) * i) / 4).toFixed(1)}
                 </text>
               </g>
@@ -250,14 +250,14 @@ export default function EntryPreviewChart({
               const up = b.close >= b.open;
               return (
                 <g key={i}>
-                  <line x1={x(start + i)} x2={x(start + i)} y1={y(b.high)} y2={y(b.low)} stroke={up ? "#52d8be" : "#f581aa"} />
+                  <line x1={x(start + i)} x2={x(start + i)} y1={y(b.high)} y2={y(b.low)} stroke={up ? "#10b981" : "#f43f5e"} />
                   <rect
                     x={x(start + i) - 3}
                     y={y(Math.max(b.open, b.close))}
                     width="6"
                     height={Math.max(1.2, Math.abs(y(b.open) - y(b.close)))}
                     rx=".5"
-                    fill={up ? "#52d8be" : "#f581aa"}
+                    fill={up ? "#10b981" : "#f43f5e"}
                   />
                 </g>
               );
@@ -281,7 +281,7 @@ export default function EntryPreviewChart({
                   cy={y(s.side === "buy" ? bars[s.index].low : bars[s.index].high) + (s.side === "buy" ? 9 : -9)}
                   r="4"
                   fill="none"
-                  stroke="#c1acff"
+                  stroke="#22d3ee"
                   strokeWidth="1.8"
                 />
               </g>
@@ -290,8 +290,8 @@ export default function EntryPreviewChart({
               .filter((e) => !e.pending)
               .map((e, i) => (
                 <g key={i}>
-                  <path d={`M ${x(e.index)} ${y(e.price) - 16} v 11 m -4 -4 l 4 4 l 4 -4`} fill="none" stroke="#fbc775" strokeWidth="2" />
-                  <text x={Math.min(RIGHT - 100, Math.max(LEFT, x(e.index)))} y={y(e.price) - 21} fill="#fbc775" fontSize="9">
+                  <path d={`M ${x(e.index)} ${y(e.price) - 16} v 11 m -4 -4 l 4 4 l 4 -4`} fill="none" stroke="#38bdf8" strokeWidth="2" />
+                  <text x={Math.min(RIGHT - 100, Math.max(LEFT, x(e.index)))} y={y(e.price) - 21} fill="#38bdf8" fontSize="9" fontWeight="bold">
                     {e.side.toUpperCase()} · {triggerLabel}
                   </text>
                   {e.exitIndex !== undefined && (
@@ -300,10 +300,10 @@ export default function EntryPreviewChart({
                         cx={x(e.exitIndex)}
                         cy={y(e.exitPrice ?? e.price)}
                         r="5"
-                        fill="#151f36"
-                        stroke={e.exitReason === "TP" ? "#55ddbf" : "#f18aab"}
+                        fill="#0b1120"
+                        stroke={e.exitReason === "TP" ? "#10b981" : "#f43f5e"}
                       />
-                      <text x={Math.min(RIGHT - 50, x(e.exitIndex) + 6)} y={y(e.exitPrice ?? e.price) - 8} fill="#d0c4f2" fontSize="9">
+                      <text x={Math.min(RIGHT - 50, x(e.exitIndex) + 6)} y={y(e.exitPrice ?? e.price) - 8} fill={e.exitReason === "TP" ? "#34d399" : "#fb7185"} fontSize="9">
                         {e.exitReason === "ambiguous" ? "TP/SL ?" : e.exitReason}
                       </text>
                     </>
@@ -320,11 +320,11 @@ export default function EntryPreviewChart({
                       x2={RIGHT}
                       y1={y(v)}
                       y2={y(v)}
-                      stroke={i ? "#55ddbf" : "#f18aab"}
+                      stroke={i ? "#10b981" : "#f43f5e"}
                       strokeDasharray="4 5"
-                      opacity=".7"
+                      opacity=".85"
                     />
-                    <text x={RIGHT - 4} y={y(v) - 5} fill={i ? "#55ddbf" : "#f18aab"} fontSize="9" textAnchor="end">
+                    <text x={RIGHT - 4} y={y(v) - 5} fill={i ? "#10b981" : "#f43f5e"} fontSize="9" fontWeight="bold" textAnchor="end">
                       {i ? "TP" : "SL"}
                     </text>
                   </g>
